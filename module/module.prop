@@ -1,0 +1,6 @@
+id=au_zygisk
+name=Among Us Zygisk Menu
+version=2.3.0
+versionCode=230
+author=rewrite
+description=Floating Java menu for Among Us (com.innersloth.spacemafia): speed, vision, noclip, local kill cooldown. Works on GLES and Vulkan. Requires Zygisk, arm64.

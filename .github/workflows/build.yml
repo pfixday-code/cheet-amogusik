@@ -1,0 +1,29 @@
+name: Build Magisk module
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Merge archive and repo sources
+        run: bash tools/prepare_tree.sh
+
+      - name: Build dex, native library and module zip
+        run: bash build/tree/tools/package_module.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: au_zygisk-magisk
+          path: build/tree/out/*.zip
+          if-no-files-found: error
