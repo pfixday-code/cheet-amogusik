@@ -4,15 +4,20 @@ import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.Application;
 import android.content.Context;
+import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Point;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -22,6 +27,7 @@ import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.ViewParent;
+import android.view.Window;
 import android.view.animation.DecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -36,17 +42,25 @@ import java.util.Locale;
  */
 public final class Menu {
     private static final String TAG = "AUMod";
-    private static final String VERSION = "v2.3";
+    private static final String VERSION = "v2.4";
 
     // Feature ids and status bits are shared with src/java_menu.cpp.
-    private static final int SPEED = 0, LIGHT = 1, NOCLIP = 2, KILL = 3;
-    private static final int ST_SPEED = 1, ST_NOCLIP = 2, ST_LIGHT = 4, ST_KILL = 8, ST_LOCAL = 16;
-    // Layout of nativeConfig(): speedOn, speedMul, lightOn, lightMul, noclip, killOn.
-    private static final int CFG_LEN = 6;
-    // Must match kSpeedMul* / kLightMul* in src/common.h.
+    private static final int SPEED = 0, LIGHT = 1, NOCLIP = 2, KILL = 3, ZOOM = 4, REVEAL = 5, GHOSTS = 6;
+    private static final int ST_SPEED = 1, ST_NOCLIP = 2, ST_LIGHT = 4, ST_KILL = 8, ST_LOCAL = 16,
+            ST_ZOOM = 32, ST_REVEAL = 64, ST_GHOSTS = 128;
+    // Layout of nativeConfig(): speedOn, speedMul, lightOn, lightMul, noclip, killOn,
+    // zoomOn, zoomMul, revealOn, ghostsOn.
+    private static final int CFG_LEN = 10;
+    // Must match kSpeedMul* / kLightMul* / kZoomMul* in src/common.h.
     private static final float SPEED_MIN = 0.5f, SPEED_MAX = 4f, LIGHT_MIN = 0.5f, LIGHT_MAX = 8f;
+    private static final float ZOOM_MIN = 1f, ZOOM_MAX = 4f;
     private static final float SLIDER_STEP = 0.05f;
     private static final long STATUS_PERIOD_MS = 1000;
+    // After attach the window is relaid out at these delays: on size-compat (letterboxed) windows the
+    // drawn surface and the input/layout frame can disagree until the first relayoutWindow().
+    private static final long[] RELAYOUT_DELAYS_MS = {0, 600, 2000};
+    private static final long RELAYOUT_MIN_GAP_MS = 250;
+    private static final int MAX_GEOMETRY_LOGS = 40;
 
     // Palette.
     private static final int BG = 0xF2181A20, SURFACE = 0xFF23262F, STROKE = 0x1FFFFFFF;
@@ -69,9 +83,13 @@ public final class Menu {
     private static TextView fab;
     private static LinearLayout panel;
     private static TextView statusPill;
-    private static FeatureRow speedRow, lightRow, noclipRow, killRow;
+    private static FeatureRow speedRow, lightRow, noclipRow, killRow, zoomRow, revealRow, ghostsRow;
     private static boolean panelOpen;
     private static int lastStatus = -1;
+    // Bumped on every attach, so delayed work posted for an old overlay does nothing.
+    private static int generation;
+    private static long lastRelayoutAt;
+    private static int geometryLogs;
     // FAB position as a fraction of the free area, kept across activity re-attach.
     private static float fabFx = 0f, fabFy = 0.3f;
 
@@ -126,7 +144,10 @@ public final class Menu {
 
     private static void attach(Activity a) {
         if (a == null || a.isFinishing()) return;
-        if (attachedTo.get() == a && root != null && root.getParent() != null) return;
+        if (attachedTo.get() == a && root != null && root.getParent() != null) {
+            forceRelayout("resume");
+            return;
+        }
         detach();
         try {
             root = build(a);
@@ -135,7 +156,10 @@ public final class Menu {
             a.addContentView(root, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT));
             attachedTo = new WeakReference<Activity>(a);
+            generation++;
+            geometryLogs = 0;
             log("attached to " + a.getClass().getName());
+            scheduleRelayouts();
             schedulePoll();
         } catch (Throwable t) {
             detach();
@@ -152,9 +176,10 @@ public final class Menu {
         fab = null;
         panel = null;
         statusPill = null;
-        speedRow = lightRow = noclipRow = killRow = null;
+        speedRow = lightRow = noclipRow = killRow = zoomRow = revealRow = ghostsRow = null;
         panelOpen = false;
         lastStatus = -1;
+        generation++;
         attachedTo = new WeakReference<Activity>(null);
     }
 
@@ -168,14 +193,101 @@ public final class Menu {
         @Override public void onActivitySaveInstanceState(Activity a, Bundle b) {}
     }
 
+    // ---------------------------------------------------------------- window geometry
+
+    private static void scheduleRelayouts() {
+        final int gen = generation;
+        for (final long delay : RELAYOUT_DELAYS_MS) {
+            MAIN.postDelayed(new Runnable() {
+                @Override public void run() { if (gen == generation) forceRelayout("attach +" + delay + " ms"); }
+            }, delay);
+        }
+    }
+
+    /**
+     * Re-applies the activity window's own attributes. ViewRootImpl then calls relayoutWindow() on
+     * the next traversal, the same round trip the IME resize triggers, which is what re-synced the
+     * drawn surface with the layout/input frame in the test report.
+     */
+    private static void forceRelayout(final String why) {
+        final Activity a = attachedTo.get();
+        if (a == null || a.isFinishing() || root == null) return;
+        final long now = SystemClock.uptimeMillis();
+        if (now - lastRelayoutAt < RELAYOUT_MIN_GAP_MS) return;
+        lastRelayoutAt = now;
+        final Window w = a.getWindow();
+        if (w == null) return;
+        try {
+            w.setAttributes(w.getAttributes());
+        } catch (Throwable t) {
+            log("relayout (" + why + ") failed: " + t);
+            return;
+        }
+        root.requestLayout();
+        final int gen = generation;
+        MAIN.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (gen != generation) return;
+                placeFab();
+                if (panelOpen) placePanel();
+                logGeometry("relayout " + why);
+            }
+        }, 150);
+    }
+
+    /** One line with every frame the menu depends on, so a bad device can be diffed before/after IME. */
+    private static void logGeometry(String why) {
+        if (root == null || geometryLogs >= MAX_GEOMETRY_LOGS) return;
+        geometryLogs++;
+        try {
+            final Activity a = attachedTo.get();
+            final int[] onScreen = new int[2], inWindow = new int[2];
+            root.getLocationOnScreen(onScreen);
+            root.getLocationInWindow(inWindow);
+            final Rect visible = new Rect();
+            root.getWindowVisibleDisplayFrame(visible);
+            final DisplayMetrics dm = root.getResources().getDisplayMetrics();
+            final Configuration cfg = root.getResources().getConfiguration();
+            final Point real = new Point();
+            View decor = null;
+            if (a != null) {
+                a.getWindowManager().getDefaultDisplay().getRealSize(real);
+                if (a.getWindow() != null) decor = a.getWindow().getDecorView();
+            }
+            log(String.format(Locale.US,
+                    "geometry [%s]: root %dx%d screen(%d,%d) window(%d,%d) decor %dx%d visibleFrame %s"
+                            + " metrics %dx%d density %.3f real %dx%d cfg %dx%d dp fab(%.0f,%.0f %dx%d)",
+                    why, root.getWidth(), root.getHeight(), onScreen[0], onScreen[1], inWindow[0], inWindow[1],
+                    decor != null ? decor.getWidth() : -1, decor != null ? decor.getHeight() : -1,
+                    visible.toShortString(), dm.widthPixels, dm.heightPixels, dm.density, real.x, real.y,
+                    cfg.screenWidthDp, cfg.screenHeightDp, fab != null ? fab.getX() : -1f,
+                    fab != null ? fab.getY() : -1f, fab != null ? fab.getWidth() : -1,
+                    fab != null ? fab.getHeight() : -1));
+        } catch (Throwable t) {
+            log("geometry [" + why + "] unavailable: " + t);
+        }
+    }
+
+    /** Overlay root: re-syncs the window when the activity configuration changes (fold, rotation). */
+    private static final class Overlay extends FrameLayout {
+        Overlay(Context c) { super(c); }
+
+        @Override protected void onConfigurationChanged(Configuration cfg) {
+            super.onConfigurationChanged(cfg);
+            MAIN.post(new Runnable() {
+                @Override public void run() { forceRelayout("configuration change"); }
+            });
+        }
+    }
+
     // ---------------------------------------------------------------- layout
 
     private static FrameLayout build(Context c) {
         final float dp = c.getResources().getDisplayMetrics().density;
         float[] cfg = nativeConfig();
-        if (cfg == null || cfg.length < CFG_LEN) cfg = new float[] {0f, 1.5f, 0f, 3f, 0f, 0f};
+        if (cfg == null || cfg.length < CFG_LEN) cfg = new float[] {0f, 1.5f, 0f, 3f, 0f, 0f, 0f, 1.5f, 0f, 0f};
 
-        final FrameLayout overlay = new FrameLayout(c);
+        final FrameLayout overlay = new Overlay(c);
         overlay.setClipChildren(false);
 
         fab = buildFab(c, dp);
@@ -189,12 +301,24 @@ public final class Menu {
             @Override public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
                 if (r - l != or - ol || b - t != ob - ot) {
                     placeFab();
+                    if (panel != null) panel.requestLayout();  // its scroll cap follows the root height
                     if (panelOpen) placePanel();
+                    logGeometry("root resized");
                 }
             }
         });
         refreshStatus();
         return overlay;
+    }
+
+    /** Event position in the coordinate space of the view's parent (the overlay root). */
+    private static void inParent(View v, MotionEvent e, float[] out) {
+        out[0] = e.getX();
+        out[1] = e.getY();
+        // getMatrix() holds translation, scale and pivot, so this also stays right during the press animation.
+        v.getMatrix().mapPoints(out);
+        out[0] += v.getLeft();
+        out[1] += v.getTop();
     }
 
     private static TextView buildFab(Context c, final float dp) {
@@ -214,21 +338,26 @@ public final class Menu {
 
         final int slop = ViewConfiguration.get(c).getScaledTouchSlop();
         v.setOnTouchListener(new View.OnTouchListener() {
+            // Drag is tracked in the overlay's own coordinates, not getRawX/Y: on a size-compat window
+            // raw coordinates are display pixels while setX/setY are app pixels.
+            private final float[] pt = new float[2];
             private float downX, downY, startX, startY;
             private boolean dragging;
 
             @Override public boolean onTouch(View view, MotionEvent e) {
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
-                        downX = e.getRawX();
-                        downY = e.getRawY();
+                        inParent(view, e, pt);
+                        downX = pt[0];
+                        downY = pt[1];
                         startX = view.getX();
                         startY = view.getY();
                         dragging = false;
                         view.animate().scaleX(0.9f).scaleY(0.9f).alpha(1f).setDuration(90).start();
                         return true;
                     case MotionEvent.ACTION_MOVE: {
-                        float dx = e.getRawX() - downX, dy = e.getRawY() - downY;
+                        inParent(view, e, pt);
+                        float dx = pt[0] - downX, dy = pt[1] - downY;
                         if (!dragging && Math.hypot(dx, dy) > slop) {
                             dragging = true;
                             if (panelOpen) closePanel();
@@ -314,6 +443,13 @@ public final class Menu {
         section(c, dp, content, "VISION");
         lightRow = new FeatureRow(c, dp, content, "Vision radius", "Light radius multiplier", LIGHT,
                 cfg[2] != 0f, cfg[3], LIGHT_MIN, LIGHT_MAX, true);
+        zoomRow = new FeatureRow(c, dp, content, "Zoom out", "Camera size multiplier", ZOOM,
+                cfg[6] != 0f, cfg[7], ZOOM_MIN, ZOOM_MAX, true);
+        section(c, dp, content, "INFO");
+        revealRow = new FeatureRow(c, dp, content, "Reveal impostors", "Red names, local view only", REVEAL,
+                cfg[8] != 0f, 0f, 0f, 1f, false);
+        ghostsRow = new FeatureRow(c, dp, content, "See ghosts", "Show dead players while alive", GHOSTS,
+                cfg[9] != 0f, 0f, 0f, 1f, false);
         section(c, dp, content, "IMPOSTOR");
         killRow = new FeatureRow(c, dp, content, "No kill cooldown", "Local timer only, the host may reject", KILL,
                 cfg[5] != 0f, 0f, 0f, 1f, false);
@@ -432,6 +568,9 @@ public final class Menu {
         if (lightRow != null) lightRow.setAvailable((st & ST_LIGHT) != 0);
         if (noclipRow != null) noclipRow.setAvailable((st & ST_NOCLIP) != 0);
         if (killRow != null) killRow.setAvailable((st & ST_KILL) != 0);
+        if (zoomRow != null) zoomRow.setAvailable((st & ST_ZOOM) != 0);
+        if (revealRow != null) revealRow.setAvailable((st & ST_REVEAL) != 0);
+        if (ghostsRow != null) ghostsRow.setAvailable((st & ST_GHOSTS) != 0);
         final boolean inGame = (st & ST_LOCAL) != 0;
         final float dp = statusPill.getResources().getDisplayMetrics().density;
         statusPill.setText(inGame ? "IN GAME" : "LOBBY");
@@ -741,7 +880,10 @@ public final class Menu {
         }
     }
 
-    /** ScrollView capped at ~62% of the screen height, so the panel fits in landscape. */
+    /**
+     * ScrollView capped at ~62% of the overlay height, so the panel fits in landscape. The overlay
+     * height is the app's real area; DisplayMetrics can describe the display on a size-compat window.
+     */
     private static final class MaxHeightScroll extends ScrollView {
         MaxHeightScroll(Context c) {
             super(c);
@@ -750,7 +892,9 @@ public final class Menu {
         }
 
         @Override protected void onMeasure(int wSpec, int hSpec) {
-            int max = Math.round(getResources().getDisplayMetrics().heightPixels * 0.62f);
+            final int avail = root != null && root.getHeight() > 0 ? root.getHeight()
+                    : getResources().getDisplayMetrics().heightPixels;
+            int max = Math.round(avail * 0.62f);
             super.onMeasure(wSpec, MeasureSpec.makeMeasureSpec(max, MeasureSpec.AT_MOST));
         }
     }

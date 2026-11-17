@@ -90,12 +90,17 @@ void ConfigLoad() {
         else if (!strcmp(key, "lightOn")) g_cfg.lightOn = v != 0.f;
         else if (!strcmp(key, "lightMul")) g_cfg.lightMul = v;
         else if (!strcmp(key, "killOn")) g_cfg.killOn = v != 0.f;
+        else if (!strcmp(key, "zoomOn")) g_cfg.zoomOn = v != 0.f;
+        else if (!strcmp(key, "zoomMul")) g_cfg.zoomMul = v;
+        else if (!strcmp(key, "revealOn")) g_cfg.revealOn = v != 0.f;
+        else if (!strcmp(key, "ghostsOn")) g_cfg.ghostsOn = v != 0.f;
         else ++bad;
     }
     fclose(f);
     // A hand-edited or corrupted file must not push NaN or absurd multipliers into the game.
     g_cfg.speedMul = Sanitize(g_cfg.speedMul, kSpeedMulMin, kSpeedMulMax, defaults.speedMul);
     g_cfg.lightMul = Sanitize(g_cfg.lightMul, kLightMulMin, kLightMulMax, defaults.lightMul);
+    g_cfg.zoomMul = Sanitize(g_cfg.zoomMul, kZoomMulMin, kZoomMulMax, defaults.zoomMul);
     if (bad) Log("config: %d unreadable line(s) in au_cfg.txt ignored", bad);
 }
 
@@ -109,8 +114,11 @@ void ConfigSave() {
         Log("config: cannot write %s (%s)", tmp.c_str(), strerror(errno));
         return;
     }
-    const int n = fprintf(f, "speedOn=%d\nspeedMul=%.3f\nnoclip=%d\nlightOn=%d\nlightMul=%.3f\nkillOn=%d\n",
-                          c.speedOn, c.speedMul, c.noclip, c.lightOn, c.lightMul, c.killOn);
+    const int n = fprintf(f,
+                          "speedOn=%d\nspeedMul=%.3f\nnoclip=%d\nlightOn=%d\nlightMul=%.3f\nkillOn=%d\n"
+                          "zoomOn=%d\nzoomMul=%.3f\nrevealOn=%d\nghostsOn=%d\n",
+                          c.speedOn, c.speedMul, c.noclip, c.lightOn, c.lightMul, c.killOn, c.zoomOn,
+                          c.zoomMul, c.revealOn, c.ghostsOn);
     const bool written = n > 0 && fflush(f) == 0;
     if (fclose(f) != 0 || !written) {
         Log("config: write to %s failed", tmp.c_str());

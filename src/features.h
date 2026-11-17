@@ -6,6 +6,9 @@ struct FeatureStatus {
     bool noclip = false;
     bool light = false;
     bool kill = false;
+    bool zoom = false;
+    bool reveal = false;
+    bool ghosts = false;
     bool localPlayerSeen = false;
 };
 extern FeatureStatus g_feat;

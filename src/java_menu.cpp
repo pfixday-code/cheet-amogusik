@@ -12,8 +12,9 @@ JavaVM* g_vm = nullptr;
 namespace {
 
 // Must match Menu.java.
-constexpr int kSpeed = 0, kLight = 1, kNoclip = 2, kKill = 3;
-constexpr int kStSpeed = 1, kStNoclip = 2, kStLight = 4, kStKill = 8, kStLocal = 16;
+constexpr int kSpeed = 0, kLight = 1, kNoclip = 2, kKill = 3, kZoom = 4, kReveal = 5, kGhosts = 6;
+constexpr int kStSpeed = 1, kStNoclip = 2, kStLight = 4, kStKill = 8, kStLocal = 16, kStZoom = 32,
+              kStReveal = 64, kStGhosts = 128;
 
 jclass g_menuClass = nullptr;  // global ref; keeps the dex class loader alive
 
@@ -40,6 +41,12 @@ void JNICALL MenuSet(JNIEnv*, jclass, jint id, jboolean on, jfloat value) {
             break;
         case kNoclip: g_cfg.noclip = b; break;
         case kKill: g_cfg.killOn = b; break;
+        case kZoom:
+            g_cfg.zoomOn = b;
+            g_cfg.zoomMul = ClampMul(value, kZoomMulMin, kZoomMulMax, g_cfg.zoomMul);
+            break;
+        case kReveal: g_cfg.revealOn = b; break;
+        case kGhosts: g_cfg.ghostsOn = b; break;
         default: return;
     }
     ConfigSave();
@@ -51,13 +58,18 @@ jint JNICALL MenuStatus(JNIEnv*, jclass) {
     if (g_feat.noclip) st |= kStNoclip;
     if (g_feat.light) st |= kStLight;
     if (g_feat.kill) st |= kStKill;
+    if (g_feat.zoom) st |= kStZoom;
+    if (g_feat.reveal) st |= kStReveal;
+    if (g_feat.ghosts) st |= kStGhosts;
     if (g_feat.localPlayerSeen) st |= kStLocal;
     return st;
 }
 
 jfloatArray JNICALL MenuConfig(JNIEnv* env, jclass) {
-    const jfloat v[] = {g_cfg.speedOn ? 1.f : 0.f, g_cfg.speedMul, g_cfg.lightOn ? 1.f : 0.f,
-                        g_cfg.lightMul,        g_cfg.noclip ? 1.f : 0.f, g_cfg.killOn ? 1.f : 0.f};
+    const jfloat v[] = {g_cfg.speedOn ? 1.f : 0.f,  g_cfg.speedMul,          g_cfg.lightOn ? 1.f : 0.f,
+                        g_cfg.lightMul,             g_cfg.noclip ? 1.f : 0.f, g_cfg.killOn ? 1.f : 0.f,
+                        g_cfg.zoomOn ? 1.f : 0.f,   g_cfg.zoomMul,           g_cfg.revealOn ? 1.f : 0.f,
+                        g_cfg.ghostsOn ? 1.f : 0.f};
     jfloatArray arr = env->NewFloatArray(static_cast<jsize>(std::size(v)));
     if (!arr) return nullptr;
     env->SetFloatArrayRegion(arr, 0, static_cast<jsize>(std::size(v)), v);
