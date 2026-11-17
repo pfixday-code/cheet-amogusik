@@ -1,5 +1,7 @@
 package au.menu;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.Application;
@@ -8,15 +10,17 @@ import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.PixelFormat;
 import android.graphics.Point;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
-import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.TypedValue;
@@ -27,7 +31,8 @@ import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.ViewParent;
-import android.view.Window;
+import android.view.ViewTreeObserver;
+import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -39,10 +44,16 @@ import java.util.Locale;
 /**
  * Floating mod menu drawn with plain Android views (custom toggle and slider, no theme or
  * resources needed), so it looks the same on every Unity build and works on GLES and Vulkan.
+ *
+ * The FAB and the panel each live in their own sub-window of the game's activity window
+ * (TYPE_APPLICATION_PANEL). Drawn inside the Unity window itself, their new frames were not
+ * presented on a size-compat screen until an IME resize; a sub-window has its own surface and its
+ * own traversals. If the sub-windows cannot be added, the views go into the activity content as
+ * before (fallback, logged).
  */
 public final class Menu {
     private static final String TAG = "AUMod";
-    private static final String VERSION = "v2.4";
+    private static final String VERSION = "v2.5";
 
     // Feature ids and status bits are shared with src/java_menu.cpp.
     private static final int SPEED = 0, LIGHT = 1, NOCLIP = 2, KILL = 3, ZOOM = 4, REVEAL = 5, GHOSTS = 6;
@@ -56,11 +67,13 @@ public final class Menu {
     private static final float ZOOM_MIN = 1f, ZOOM_MAX = 4f;
     private static final float SLIDER_STEP = 0.05f;
     private static final long STATUS_PERIOD_MS = 1000;
-    // After attach the window is relaid out at these delays: on size-compat (letterboxed) windows the
-    // drawn surface and the input/layout frame can disagree until the first relayoutWindow().
-    private static final long[] RELAYOUT_DELAYS_MS = {0, 600, 2000};
-    private static final long RELAYOUT_MIN_GAP_MS = 250;
-    private static final int MAX_GEOMETRY_LOGS = 40;
+    private static final int FAB_DP = 54, PANEL_DP = 300;
+    // The activity window needs a token and a size before sub-windows can be attached to it.
+    private static final int ATTACH_ATTEMPTS = 50;
+    private static final long ATTACH_RETRY_MS = 100;
+    // Animations are cosmetic: if one has not finished by then, its final state is forced.
+    private static final long ANIM_WATCHDOG_MS = 450;
+    private static final int MAX_GEOMETRY_LOGS = 40, MAX_TOUCH_LOGS = 30;
 
     // Palette.
     private static final int BG = 0xF2181A20, SURFACE = 0xFF23262F, STROKE = 0x1FFFFFFF;
@@ -79,18 +92,33 @@ public final class Menu {
     private static boolean callbacksRegistered;
     private static boolean polling;
 
-    private static FrameLayout root;
-    private static TextView fab;
+    // true: FAB and panel are sub-windows; false: both live in contentRoot inside the activity window.
+    private static boolean windowMode;
+    private static WindowManager wm;
+    private static WindowManager.LayoutParams fabLp, panelLp;
+    private static View parentView;          // decor view (window mode) or contentRoot (fallback)
+    private static FrameLayout contentRoot;  // fallback only
+    private static FrameLayout fabHost;      // receives the FAB touches, never transformed
+    private static TextView fab;             // drawn button inside fabHost, carries the press animation
     private static LinearLayout panel;
     private static TextView statusPill;
     private static FeatureRow speedRow, lightRow, noclipRow, killRow, zoomRow, revealRow, ghostsRow;
     private static boolean panelOpen;
     private static int lastStatus = -1;
-    // Bumped on every attach, so delayed work posted for an old overlay does nothing.
+    // Bumped on every attach and detach, so delayed work posted for an old menu does nothing.
     private static int generation;
-    private static long lastRelayoutAt;
-    private static int geometryLogs;
-    // FAB position as a fraction of the free area, kept across activity re-attach.
+    private static int geometryLogs, touchLogs;
+    private static int fabDraws, panelDraws;
+    private static ValueAnimator snapAnim;
+    // addView() attaches on the next traversal, so isAttachedToWindow() cannot tell what to remove.
+    private static boolean fabAdded, panelAdded;
+    private static final View.OnLayoutChangeListener PARENT_RESIZE = new View.OnLayoutChangeListener() {
+        @Override public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
+            if (r - l != or - ol || b - t != ob - ot) onParentResized("parent resized");
+        }
+    };
+    // Applied positions in the parent's coordinates (app pixels); fractions survive re-attach.
+    private static float fabX, fabY;
     private static float fabFx = 0f, fabFy = 0.3f;
 
     private Menu() {}
@@ -144,22 +172,83 @@ public final class Menu {
 
     private static void attach(Activity a) {
         if (a == null || a.isFinishing()) return;
-        if (attachedTo.get() == a && root != null && root.getParent() != null) {
-            forceRelayout("resume");
+        if (attachedTo.get() == a && fabHost != null && fabHost.isAttachedToWindow()) return;
+        detach();
+        attachedTo = new WeakReference<Activity>(a);
+        geometryLogs = 0;
+        touchLogs = 0;
+        tryAttach(a, generation, 0);
+    }
+
+    private static void tryAttach(final Activity a, final int gen, final int attempt) {
+        if (gen != generation || a.isFinishing()) return;
+        final View decor = a.getWindow() != null ? a.getWindow().getDecorView() : null;
+        if (decor == null || decor.getWindowToken() == null || decor.getWidth() == 0 || decor.getHeight() == 0) {
+            if (attempt < ATTACH_ATTEMPTS) {
+                MAIN.postDelayed(new Runnable() {
+                    @Override public void run() { tryAttach(a, gen, attempt + 1); }
+                }, ATTACH_RETRY_MS);
+            } else {
+                log("activity window has no token/size after " + ATTACH_ATTEMPTS * ATTACH_RETRY_MS
+                        + " ms, using the in-content fallback");
+                attachInContent(a);
+            }
             return;
         }
-        detach();
         try {
-            root = build(a);
-            // Full-screen container that never consumes touches itself: taps that miss the FAB and
-            // the panel fall through to Unity's view underneath.
-            a.addContentView(root, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            attachAsWindows(a, decor);
+        } catch (Throwable t) {
+            log("sub-window attach failed: " + t + "; using the in-content fallback");
+            removeMenuViews();
+            attachInContent(a);
+        }
+    }
+
+    private static void attachAsWindows(Activity a, View decor) {
+        final float dp = a.getResources().getDisplayMetrics().density;
+        buildViews(a, dp);
+        // A WRAP_CONTENT window clips the shadow to a hard edge; the stroke already outlines the panel.
+        panel.setElevation(0f);
+        wm = a.getWindowManager();
+        final IBinder token = decor.getWindowToken();
+        fabLp = subWindowParams(token, px(FAB_DP, dp), px(FAB_DP, dp));
+        panelLp = subWindowParams(token, px(PANEL_DP, dp), ViewGroup.LayoutParams.WRAP_CONTENT);
+        parentView = decor;
+        windowMode = true;
+        fabX = clamp(fabFx, 0f, 1f) * freeWidth();
+        fabY = clamp(fabFy, 0f, 1f) * freeHeight();
+        fabLp.x = Math.round(fabX);
+        fabLp.y = Math.round(fabY);
+        panel.setVisibility(View.INVISIBLE);  // an invisible root view hides its window and its touch area
+        wm.addView(fabHost, fabLp);
+        fabAdded = true;
+        wm.addView(panel, panelLp);
+        panelAdded = true;
+        decor.addOnLayoutChangeListener(PARENT_RESIZE);
+        installDrawCounters();
+        log("attached to " + a.getClass().getName() + " as sub-windows");
+        logGeometry("attach");
+        schedulePoll();
+    }
+
+    private static void attachInContent(Activity a) {
+        try {
+            final float dp = a.getResources().getDisplayMetrics().density;
+            removeMenuViews();
+            buildViews(a, dp);
+            windowMode = false;
+            contentRoot = new FrameLayout(a);
+            contentRoot.setClipChildren(false);
+            contentRoot.addView(fabHost, new FrameLayout.LayoutParams(px(FAB_DP, dp), px(FAB_DP, dp)));
+            contentRoot.addView(panel, new FrameLayout.LayoutParams(px(PANEL_DP, dp), ViewGroup.LayoutParams.WRAP_CONTENT));
+            panel.setVisibility(View.INVISIBLE);
+            // Full-screen container that never consumes touches itself.
+            a.addContentView(contentRoot, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT));
-            attachedTo = new WeakReference<Activity>(a);
-            generation++;
-            geometryLogs = 0;
-            log("attached to " + a.getClass().getName());
-            scheduleRelayouts();
+            parentView = contentRoot;
+            contentRoot.addOnLayoutChangeListener(PARENT_RESIZE);
+            installDrawCounters();
+            log("attached to " + a.getClass().getName() + " in content (fallback)");
             schedulePoll();
         } catch (Throwable t) {
             detach();
@@ -167,17 +256,58 @@ public final class Menu {
         }
     }
 
-    private static void detach() {
-        if (root != null) {
-            ViewParent p = root.getParent();
-            if (p instanceof ViewGroup) ((ViewGroup) p).removeView(root);
+    private static WindowManager.LayoutParams subWindowParams(IBinder token, int w, int h) {
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(w, h,
+                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                PixelFormat.TRANSLUCENT);
+        lp.gravity = Gravity.TOP | Gravity.LEFT;
+        lp.token = token;
+        if (Build.VERSION.SDK_INT >= 28)
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        lp.setTitle("AUMenu");
+        return lp;
+    }
+
+    /** Removes the FAB and panel from wherever they are; safe to call in any state. */
+    private static void removeMenuViews() {
+        if (parentView != null) parentView.removeOnLayoutChangeListener(PARENT_RESIZE);
+        if (wm != null) {
+            if (fabAdded && fabHost != null) removeWindow(fabHost);
+            if (panelAdded && panel != null) removeWindow(panel);
         }
-        root = null;
+        fabAdded = panelAdded = false;
+        if (contentRoot != null) {
+            ViewParent p = contentRoot.getParent();
+            if (p instanceof ViewGroup) ((ViewGroup) p).removeView(contentRoot);
+        }
+        wm = null;
+        fabLp = panelLp = null;
+        parentView = null;
+        contentRoot = null;
+    }
+
+    private static void removeWindow(View v) {
+        try {
+            wm.removeViewImmediate(v);
+        } catch (Throwable t) {
+            // The parent window may already be gone (activity destroyed), which removes ours with it.
+            log("removing a menu window: " + t);
+        }
+    }
+
+    private static void detach() {
+        if (snapAnim != null) snapAnim.cancel();
+        snapAnim = null;
+        removeMenuViews();
+        fabHost = null;
         fab = null;
         panel = null;
         statusPill = null;
         speedRow = lightRow = noclipRow = killRow = zoomRow = revealRow = ghostsRow = null;
         panelOpen = false;
+        windowMode = false;
         lastStatus = -1;
         generation++;
         attachedTo = new WeakReference<Activity>(null);
@@ -193,135 +323,103 @@ public final class Menu {
         @Override public void onActivitySaveInstanceState(Activity a, Bundle b) {}
     }
 
-    // ---------------------------------------------------------------- window geometry
-
-    private static void scheduleRelayouts() {
-        final int gen = generation;
-        for (final long delay : RELAYOUT_DELAYS_MS) {
-            MAIN.postDelayed(new Runnable() {
-                @Override public void run() { if (gen == generation) forceRelayout("attach +" + delay + " ms"); }
-            }, delay);
-        }
+    private static void onParentResized(String why) {
+        if (fabHost == null) return;
+        placeFab();
+        if (panel != null) panel.requestLayout();  // its scroll cap follows the parent height
+        if (panelOpen) placePanel();
+        logGeometry(why);
     }
 
-    /**
-     * Re-applies the activity window's own attributes. ViewRootImpl then calls relayoutWindow() on
-     * the next traversal, the same round trip the IME resize triggers, which is what re-synced the
-     * drawn surface with the layout/input frame in the test report.
-     */
-    private static void forceRelayout(final String why) {
-        final Activity a = attachedTo.get();
-        if (a == null || a.isFinishing() || root == null) return;
-        final long now = SystemClock.uptimeMillis();
-        if (now - lastRelayoutAt < RELAYOUT_MIN_GAP_MS) return;
-        lastRelayoutAt = now;
-        final Window w = a.getWindow();
-        if (w == null) return;
-        try {
-            w.setAttributes(w.getAttributes());
-        } catch (Throwable t) {
-            log("relayout (" + why + ") failed: " + t);
-            return;
-        }
-        root.requestLayout();
-        final int gen = generation;
-        MAIN.postDelayed(new Runnable() {
-            @Override public void run() {
-                if (gen != generation) return;
-                placeFab();
-                if (panelOpen) placePanel();
-                logGeometry("relayout " + why);
-            }
-        }, 150);
+    // ---------------------------------------------------------------- diagnostics
+
+    private static void installDrawCounters() {
+        fabDraws = panelDraws = 0;
+        fabHost.getViewTreeObserver().addOnDrawListener(new ViewTreeObserver.OnDrawListener() {
+            @Override public void onDraw() { fabDraws++; }
+        });
+        panel.getViewTreeObserver().addOnDrawListener(new ViewTreeObserver.OnDrawListener() {
+            @Override public void onDraw() { panelDraws++; }
+        });
     }
 
     /** One line with every frame the menu depends on, so a bad device can be diffed before/after IME. */
     private static void logGeometry(String why) {
-        if (root == null || geometryLogs >= MAX_GEOMETRY_LOGS) return;
+        if (fabHost == null || parentView == null || geometryLogs >= MAX_GEOMETRY_LOGS) return;
         geometryLogs++;
         try {
             final Activity a = attachedTo.get();
-            final int[] onScreen = new int[2], inWindow = new int[2];
-            root.getLocationOnScreen(onScreen);
-            root.getLocationInWindow(inWindow);
+            final int[] parentOnScreen = new int[2], fabOnScreen = new int[2];
+            parentView.getLocationOnScreen(parentOnScreen);
+            fabHost.getLocationOnScreen(fabOnScreen);
             final Rect visible = new Rect();
-            root.getWindowVisibleDisplayFrame(visible);
-            final DisplayMetrics dm = root.getResources().getDisplayMetrics();
-            final Configuration cfg = root.getResources().getConfiguration();
+            parentView.getWindowVisibleDisplayFrame(visible);
+            final DisplayMetrics dm = parentView.getResources().getDisplayMetrics();
+            final Configuration cfg = parentView.getResources().getConfiguration();
             final Point real = new Point();
-            View decor = null;
-            if (a != null) {
-                a.getWindowManager().getDefaultDisplay().getRealSize(real);
-                if (a.getWindow() != null) decor = a.getWindow().getDecorView();
-            }
+            if (a != null) a.getWindowManager().getDefaultDisplay().getRealSize(real);
             log(String.format(Locale.US,
-                    "geometry [%s]: root %dx%d screen(%d,%d) window(%d,%d) decor %dx%d visibleFrame %s"
-                            + " metrics %dx%d density %.3f real %dx%d cfg %dx%d dp fab(%.0f,%.0f %dx%d)",
-                    why, root.getWidth(), root.getHeight(), onScreen[0], onScreen[1], inWindow[0], inWindow[1],
-                    decor != null ? decor.getWidth() : -1, decor != null ? decor.getHeight() : -1,
-                    visible.toShortString(), dm.widthPixels, dm.heightPixels, dm.density, real.x, real.y,
-                    cfg.screenWidthDp, cfg.screenHeightDp, fab != null ? fab.getX() : -1f,
-                    fab != null ? fab.getY() : -1f, fab != null ? fab.getWidth() : -1,
-                    fab != null ? fab.getHeight() : -1));
+                    "geometry [%s]: mode %s parent %dx%d screen(%d,%d) visibleFrame %s metrics %dx%d density %.3f"
+                            + " real %dx%d cfg %dx%d dp fab(%.0f,%.0f %dx%d) fabScreen(%d,%d)",
+                    why, windowMode ? "windows" : "content", parentView.getWidth(), parentView.getHeight(),
+                    parentOnScreen[0], parentOnScreen[1], visible.toShortString(), dm.widthPixels, dm.heightPixels,
+                    dm.density, real.x, real.y, cfg.screenWidthDp, cfg.screenHeightDp, fabX, fabY,
+                    fabHost.getWidth(), fabHost.getHeight(), fabOnScreen[0], fabOnScreen[1]));
         } catch (Throwable t) {
             log("geometry [" + why + "] unavailable: " + t);
         }
     }
 
-    /** Overlay root: re-syncs the window when the activity configuration changes (fold, rotation). */
-    private static final class Overlay extends FrameLayout {
-        Overlay(Context c) { super(c); }
+    /** What the panel really is at this moment: answers "alpha stuck" vs "no traversal" vs "no input". */
+    private static void logPanelState(String why) {
+        if (panel == null) return;
+        final int[] onScreen = new int[2];
+        panel.getLocationOnScreen(onScreen);
+        log(String.format(Locale.US,
+                "panel [%s]: mode %s open %b visibility %d alpha %.2f scale %.2f shown %b attached %b laidOut %b"
+                        + " size %dx%d at(%.0f,%.0f) screen(%d,%d) windowVisibility %d draws fab %d panel %d",
+                why, windowMode ? "windows" : "content", panelOpen, panel.getVisibility(), panel.getAlpha(),
+                panel.getScaleX(), panel.isShown(), panel.isAttachedToWindow(), panel.isLaidOut(), panel.getWidth(),
+                panel.getHeight(), windowMode && panelLp != null ? (float) panelLp.x : panel.getX(),
+                windowMode && panelLp != null ? (float) panelLp.y : panel.getY(), onScreen[0], onScreen[1],
+                panel.getWindowVisibility(), fabDraws, panelDraws));
+    }
 
-        @Override protected void onConfigurationChanged(Configuration cfg) {
-            super.onConfigurationChanged(cfg);
-            MAIN.post(new Runnable() {
-                @Override public void run() { forceRelayout("configuration change"); }
-            });
-        }
+    private static void logTouch(String who, MotionEvent e) {
+        if (touchLogs >= MAX_TOUCH_LOGS) return;
+        touchLogs++;
+        log(String.format(Locale.US, "touch %s down local(%.0f,%.0f) raw(%.0f,%.0f)", who, e.getX(), e.getY(),
+                e.getRawX(), e.getRawY()));
     }
 
     // ---------------------------------------------------------------- layout
 
-    private static FrameLayout build(Context c) {
-        final float dp = c.getResources().getDisplayMetrics().density;
+    private static void buildViews(Context c, float dp) {
         float[] cfg = nativeConfig();
         if (cfg == null || cfg.length < CFG_LEN) cfg = new float[] {0f, 1.5f, 0f, 3f, 0f, 0f, 0f, 1.5f, 0f, 0f};
-
-        final FrameLayout overlay = new Overlay(c);
-        overlay.setClipChildren(false);
-
+        fabHost = new FabHost(c);
+        fabHost.setClipChildren(false);
         fab = buildFab(c, dp);
-        overlay.addView(fab, new FrameLayout.LayoutParams(px(54, dp), px(54, dp)));
-
+        fabHost.addView(fab, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        fabHost.setOnTouchListener(fabTouch(c, dp));
         panel = buildPanel(c, dp, cfg);
-        overlay.addView(panel, new FrameLayout.LayoutParams(px(300, dp), ViewGroup.LayoutParams.WRAP_CONTENT));
-        panel.setVisibility(View.INVISIBLE);  // laid out (so it has a size) but not touchable
-
-        overlay.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
-            @Override public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
-                if (r - l != or - ol || b - t != ob - ot) {
-                    placeFab();
-                    if (panel != null) panel.requestLayout();  // its scroll cap follows the root height
-                    if (panelOpen) placePanel();
-                    logGeometry("root resized");
-                }
-            }
-        });
         refreshStatus();
-        return overlay;
     }
 
-    /** Event position in the coordinate space of the view's parent (the overlay root). */
-    private static void inParent(View v, MotionEvent e, float[] out) {
-        out[0] = e.getX();
-        out[1] = e.getY();
-        // getMatrix() holds translation, scale and pivot, so this also stays right during the press animation.
-        v.getMatrix().mapPoints(out);
-        out[0] += v.getLeft();
-        out[1] += v.getTop();
+    /** FAB container: also re-places the menu when the activity configuration changes (fold, rotation). */
+    private static final class FabHost extends FrameLayout {
+        FabHost(Context c) { super(c); }
+
+        @Override protected void onConfigurationChanged(Configuration cfg) {
+            super.onConfigurationChanged(cfg);
+            MAIN.post(new Runnable() {
+                @Override public void run() { onParentResized("configuration change"); }
+            });
+        }
     }
 
-    private static TextView buildFab(Context c, final float dp) {
+    private static TextView buildFab(Context c, float dp) {
         final TextView v = new TextView(c);
         v.setText("AU");
         v.setTextColor(Color.WHITE);
@@ -333,44 +431,57 @@ public final class Menu {
         bg.setShape(GradientDrawable.OVAL);
         bg.setStroke(px(2, dp), 0x40FFFFFF);
         v.setBackground(bg);
-        v.setElevation(10 * dp);
         v.setAlpha(0.9f);
+        return v;
+    }
 
+    /**
+     * Event position in the parent's coordinates. The host's window/view offset is read from the
+     * framework at event time, so a window move that has not landed yet cannot make the drag jump,
+     * and raw (display-pixel) coordinates are never mixed with app pixels.
+     */
+    private static void inParent(View host, MotionEvent e, int[] tmpHost, int[] tmpParent, float[] out) {
+        host.getLocationOnScreen(tmpHost);
+        parentView.getLocationOnScreen(tmpParent);
+        out[0] = tmpHost[0] - tmpParent[0] + e.getX();
+        out[1] = tmpHost[1] - tmpParent[1] + e.getY();
+    }
+
+    private static View.OnTouchListener fabTouch(Context c, final float dp) {
         final int slop = ViewConfiguration.get(c).getScaledTouchSlop();
-        v.setOnTouchListener(new View.OnTouchListener() {
-            // Drag is tracked in the overlay's own coordinates, not getRawX/Y: on a size-compat window
-            // raw coordinates are display pixels while setX/setY are app pixels.
+        return new View.OnTouchListener() {
+            private final int[] a = new int[2], b = new int[2];
             private final float[] pt = new float[2];
             private float downX, downY, startX, startY;
             private boolean dragging;
 
             @Override public boolean onTouch(View view, MotionEvent e) {
+                if (parentView == null || fab == null) return false;
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
-                        inParent(view, e, pt);
+                        logTouch("fab", e);
+                        if (snapAnim != null) snapAnim.cancel();
+                        inParent(view, e, a, b, pt);
                         downX = pt[0];
                         downY = pt[1];
-                        startX = view.getX();
-                        startY = view.getY();
+                        startX = fabX;
+                        startY = fabY;
                         dragging = false;
-                        view.animate().scaleX(0.9f).scaleY(0.9f).alpha(1f).setDuration(90).start();
+                        fab.animate().scaleX(0.9f).scaleY(0.9f).alpha(1f).setDuration(90).start();
                         return true;
                     case MotionEvent.ACTION_MOVE: {
-                        inParent(view, e, pt);
+                        inParent(view, e, a, b, pt);
                         float dx = pt[0] - downX, dy = pt[1] - downY;
                         if (!dragging && Math.hypot(dx, dy) > slop) {
                             dragging = true;
                             if (panelOpen) closePanel();
                         }
-                        if (dragging) {
-                            view.setX(clamp(startX + dx, 0, freeWidth()));
-                            view.setY(clamp(startY + dy, 0, freeHeight()));
-                        }
+                        if (dragging) applyFab(clamp(startX + dx, 0, freeWidth()), clamp(startY + dy, 0, freeHeight()));
                         return true;
                     }
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
-                        view.animate().scaleX(1f).scaleY(1f).alpha(0.9f).setDuration(120).start();
+                        fab.animate().scaleX(1f).scaleY(1f).alpha(0.9f).setDuration(120).start();
                         if (dragging) snapFab(dp);
                         else if (e.getActionMasked() == MotionEvent.ACTION_UP) {
                             view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
@@ -382,12 +493,11 @@ public final class Menu {
                         return false;
                 }
             }
-        });
-        return v;
+        };
     }
 
     private static LinearLayout buildPanel(Context c, float dp, float[] cfg) {
-        LinearLayout p = new LinearLayout(c);
+        LinearLayout p = new PanelLayout(c);
         p.setOrientation(LinearLayout.VERTICAL);
         p.setBackground(rounded(BG, 18 * dp, STROKE, px(1, dp)));
         p.setElevation(14 * dp);
@@ -493,43 +603,115 @@ public final class Menu {
 
     // ---------------------------------------------------------------- placement and animation
 
-    private static float freeWidth() { return root == null || fab == null ? 0 : Math.max(0, root.getWidth() - fab.getWidth()); }
-    private static float freeHeight() { return root == null || fab == null ? 0 : Math.max(0, root.getHeight() - fab.getHeight()); }
+    private static int parentWidth() { return parentView == null ? 0 : parentView.getWidth(); }
+    private static int parentHeight() { return parentView == null ? 0 : parentView.getHeight(); }
+    private static int fabSize() {
+        if (fabHost == null) return 0;
+        if (fabHost.getWidth() > 0) return fabHost.getWidth();
+        return px(FAB_DP, fabHost.getResources().getDisplayMetrics().density);
+    }
+    private static float freeWidth() { return Math.max(0, parentWidth() - fabSize()); }
+    private static float freeHeight() { return Math.max(0, parentHeight() - fabSize()); }
+
+    private static void applyFab(float x, float y) {
+        if (fabHost == null) return;
+        fabX = x;
+        fabY = y;
+        if (!windowMode) {
+            fabHost.setX(x);
+            fabHost.setY(y);
+            return;
+        }
+        if (wm == null || fabLp == null || !fabAdded) return;
+        final int ix = Math.round(x), iy = Math.round(y);
+        if (fabLp.x == ix && fabLp.y == iy) return;
+        fabLp.x = ix;
+        fabLp.y = iy;
+        try {
+            wm.updateViewLayout(fabHost, fabLp);
+        } catch (Throwable t) {
+            log("moving the FAB window failed: " + t);
+        }
+    }
+
+    private static void applyPanel(float x, float y) {
+        if (panel == null) return;
+        if (!windowMode) {
+            panel.setX(x);
+            panel.setY(y);
+            return;
+        }
+        if (wm == null || panelLp == null || !panelAdded) return;
+        panelLp.x = Math.round(x);
+        panelLp.y = Math.round(y);
+        try {
+            wm.updateViewLayout(panel, panelLp);
+        } catch (Throwable t) {
+            log("moving the panel window failed: " + t);
+        }
+    }
 
     private static void placeFab() {
-        if (fab == null) return;
-        fab.setX(clamp(fabFx, 0f, 1f) * freeWidth());
-        fab.setY(clamp(fabFy, 0f, 1f) * freeHeight());
+        if (fabHost == null) return;
+        applyFab(clamp(fabFx, 0f, 1f) * freeWidth(), clamp(fabFy, 0f, 1f) * freeHeight());
     }
 
     private static void snapFab(float dp) {
-        if (fab == null || root == null) return;
+        if (fabHost == null) return;
         final float margin = 10 * dp;
         final float fw = freeWidth(), fh = freeHeight();
-        final float targetX = fab.getX() + fab.getWidth() / 2f < root.getWidth() / 2f ? margin : Math.max(margin, fw - margin);
-        final float y = clamp(fab.getY(), margin, Math.max(margin, fh - margin));
-        fabFx = fw > 0 ? targetX / fw : 0f;
-        fabFy = fh > 0 ? y / fh : 0f;
-        fab.animate().x(targetX).y(y).setDuration(220).setInterpolator(new DecelerateInterpolator()).start();
+        final float tx = fabX + fabSize() / 2f < parentWidth() / 2f ? margin : Math.max(margin, fw - margin);
+        final float ty = clamp(fabY, margin, Math.max(margin, fh - margin));
+        fabFx = fw > 0 ? tx / fw : 0f;
+        fabFy = fh > 0 ? ty / fh : 0f;
+        final float sx = fabX, sy = fabY;
+        if (snapAnim != null) snapAnim.cancel();
+        final ValueAnimator anim = ValueAnimator.ofFloat(0f, 1f);
+        anim.setDuration(220);
+        anim.setInterpolator(new DecelerateInterpolator());
+        anim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+            @Override public void onAnimationUpdate(ValueAnimator a) {
+                final float t = (Float) a.getAnimatedValue();
+                applyFab(sx + (tx - sx) * t, sy + (ty - sy) * t);
+            }
+        });
+        anim.addListener(new AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(Animator a) {
+                if (snapAnim == anim) snapAnim = null;
+            }
+        });
+        snapAnim = anim;
+        anim.start();
+        final int gen = generation;
+        MAIN.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (gen != generation || snapAnim != anim) return;
+                anim.end();  // jumps to the final position and fires the end listener
+                log("snap animation did not finish, final position forced");
+            }
+        }, ANIM_WATCHDOG_MS);
     }
 
     private static void placePanel() {
-        if (panel == null || fab == null || root == null) return;
-        final int pw = panel.getWidth(), ph = panel.getHeight();
-        if (pw == 0 || ph == 0) {
-            panel.post(new Runnable() { @Override public void run() { placePanel(); } });
-            return;
-        }
+        if (panel == null || fabHost == null || parentView == null) return;
         final float dp = panel.getResources().getDisplayMetrics().density;
+        int pw = panel.getWidth(), ph = panel.getHeight();
+        if (pw == 0 || ph == 0) {
+            // Not laid out yet (its window is hidden until now): measure it the way its window will.
+            panel.measure(View.MeasureSpec.makeMeasureSpec(px(PANEL_DP, dp), View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(Math.max(1, parentHeight()), View.MeasureSpec.AT_MOST));
+            pw = panel.getMeasuredWidth();
+            ph = panel.getMeasuredHeight();
+        }
         final float gap = 10 * dp, margin = 8 * dp;
-        final boolean fabOnLeft = fab.getX() + fab.getWidth() / 2f < root.getWidth() / 2f;
-        float x = fabOnLeft ? fab.getX() + fab.getWidth() + gap : fab.getX() - pw - gap;
-        x = clamp(x, margin, Math.max(margin, root.getWidth() - pw - margin));
-        float y = clamp(fab.getY(), margin, Math.max(margin, root.getHeight() - ph - margin));
-        panel.setX(x);
-        panel.setY(y);
+        final int fs = fabSize(), w = parentWidth(), h = parentHeight();
+        final boolean fabOnLeft = fabX + fs / 2f < w / 2f;
+        float x = fabOnLeft ? fabX + fs + gap : fabX - pw - gap;
+        x = clamp(x, margin, Math.max(margin, w - pw - margin));
+        float y = clamp(fabY, margin, Math.max(margin, h - ph - margin));
+        applyPanel(x, y);
         panel.setPivotX(fabOnLeft ? 0f : pw);
-        panel.setPivotY(Math.max(0f, Math.min(ph, fab.getY() + fab.getHeight() / 2f - y)));
+        panel.setPivotY(Math.max(0f, Math.min(ph, fabY + fs / 2f - y)));
     }
 
     private static void openPanel() {
@@ -544,6 +726,24 @@ public final class Menu {
         panel.setVisibility(View.VISIBLE);
         panel.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(180)
                 .setInterpolator(new DecelerateInterpolator()).start();
+        final int gen = generation;
+        MAIN.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (gen != generation || panel == null || !panelOpen) return;
+                if (panel.getAlpha() < 1f || panel.getScaleX() < 1f) {
+                    log(String.format(Locale.US, "open animation stuck at alpha %.2f scale %.2f, final state forced",
+                            panel.getAlpha(), panel.getScaleX()));
+                    panel.animate().cancel();
+                    panel.setAlpha(1f);
+                    panel.setScaleX(1f);
+                    panel.setScaleY(1f);
+                }
+                logPanelState("open +" + ANIM_WATCHDOG_MS + " ms");
+            }
+        }, ANIM_WATCHDOG_MS);
+        MAIN.postDelayed(new Runnable() {
+            @Override public void run() { if (gen == generation && panelOpen) logPanelState("open +1500 ms"); }
+        }, 1500);
     }
 
     private static void closePanel() {
@@ -555,6 +755,15 @@ public final class Menu {
                 .withEndAction(new Runnable() {
                     @Override public void run() { if (!panelOpen) p.setVisibility(View.INVISIBLE); }
                 }).start();
+        final int gen = generation;
+        MAIN.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (gen != generation || panelOpen || p.getVisibility() != View.VISIBLE) return;
+                p.animate().cancel();
+                p.setVisibility(View.INVISIBLE);
+                log("close animation did not finish, panel hidden");
+            }
+        }, ANIM_WATCHDOG_MS);
     }
 
     // ---------------------------------------------------------------- status
@@ -583,7 +792,7 @@ public final class Menu {
         polling = true;
         MAIN.postDelayed(new Runnable() {
             @Override public void run() {
-                if (root == null) {
+                if (fabHost == null) {
                     polling = false;
                     return;
                 }
@@ -881,8 +1090,8 @@ public final class Menu {
     }
 
     /**
-     * ScrollView capped at ~62% of the overlay height, so the panel fits in landscape. The overlay
-     * height is the app's real area; DisplayMetrics can describe the display on a size-compat window.
+     * ScrollView capped at ~62% of the parent height, so the panel fits in landscape. The parent is
+     * the app's real area; DisplayMetrics can describe the display on a size-compat window.
      */
     private static final class MaxHeightScroll extends ScrollView {
         MaxHeightScroll(Context c) {
@@ -892,10 +1101,19 @@ public final class Menu {
         }
 
         @Override protected void onMeasure(int wSpec, int hSpec) {
-            final int avail = root != null && root.getHeight() > 0 ? root.getHeight()
-                    : getResources().getDisplayMetrics().heightPixels;
+            final int avail = parentHeight() > 0 ? parentHeight() : getResources().getDisplayMetrics().heightPixels;
             int max = Math.round(avail * 0.62f);
             super.onMeasure(wSpec, MeasureSpec.makeMeasureSpec(max, MeasureSpec.AT_MOST));
+        }
+    }
+
+    /** Panel root: logs the first touches that reach it, so "no input" and "input missed" can be told apart. */
+    private static final class PanelLayout extends LinearLayout {
+        PanelLayout(Context c) { super(c); }
+
+        @Override public boolean dispatchTouchEvent(MotionEvent e) {
+            if (e.getActionMasked() == MotionEvent.ACTION_DOWN) logTouch("panel", e);
+            return super.dispatchTouchEvent(e);
         }
     }
 }
