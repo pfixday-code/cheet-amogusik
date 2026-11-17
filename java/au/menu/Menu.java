@@ -53,7 +53,7 @@ import java.util.Locale;
  */
 public final class Menu {
     private static final String TAG = "AUMod";
-    private static final String VERSION = "v2.5";
+    private static final String VERSION = "v2.6";
 
     // Feature ids and status bits are shared with src/java_menu.cpp.
     private static final int SPEED = 0, LIGHT = 1, NOCLIP = 2, KILL = 3, ZOOM = 4, REVEAL = 5, GHOSTS = 6;
@@ -73,7 +73,9 @@ public final class Menu {
     private static final long ATTACH_RETRY_MS = 100;
     // Animations are cosmetic: if one has not finished by then, its final state is forced.
     private static final long ANIM_WATCHDOG_MS = 450;
-    private static final int MAX_GEOMETRY_LOGS = 40, MAX_TOUCH_LOGS = 30;
+    private static final int MAX_GEOMETRY_LOGS = 40, MAX_TOUCH_LOGS = 60, MAX_MOVE_LOGS_PER_GESTURE = 3;
+    // Below this raw distance the raw-to-app scale is not measured from a gesture.
+    private static final float MIN_CALIBRATION_RAW_PX = 8f;
 
     // Palette.
     private static final int BG = 0xF2181A20, SURFACE = 0xFF23262F, STROKE = 0x1FFFFFFF;
@@ -110,6 +112,9 @@ public final class Menu {
     private static int geometryLogs, touchLogs;
     private static int fabDraws, panelDraws;
     private static ValueAnimator snapAnim;
+    // App pixels per raw pixel, measured from drags (0 = not measured yet) and the raw distance it came from.
+    private static float rawScale;
+    private static double rawScaleBasis;
     // addView() attaches on the next traversal, so isAttachedToWindow() cannot tell what to remove.
     private static boolean fabAdded, panelAdded;
     private static final View.OnLayoutChangeListener PARENT_RESIZE = new View.OnLayoutChangeListener() {
@@ -452,8 +457,10 @@ public final class Menu {
         return new View.OnTouchListener() {
             private final int[] a = new int[2], b = new int[2];
             private final float[] pt = new float[2];
-            private float downX, downY, startX, startY;
-            private boolean dragging;
+            private float downLX, downLY, downRX, downRY, downX, downY, startX, startY;
+            private float scale;  // app pixels per raw pixel for this gesture
+            private boolean dragging, useRaw;
+            private int moves, moveLogs;
 
             @Override public boolean onTouch(View view, MotionEvent e) {
                 if (parentView == null || fab == null) return false;
@@ -461,29 +468,58 @@ public final class Menu {
                     case MotionEvent.ACTION_DOWN:
                         logTouch("fab", e);
                         if (snapAnim != null) snapAnim.cancel();
+                        downLX = e.getX();
+                        downLY = e.getY();
+                        downRX = e.getRawX();
+                        downRY = e.getRawY();
                         inParent(view, e, a, b, pt);
                         downX = pt[0];
                         downY = pt[1];
                         startX = fabX;
                         startY = fabY;
                         dragging = false;
+                        useRaw = false;
+                        moves = 0;
+                        moveLogs = 0;
                         fab.animate().scaleX(0.9f).scaleY(0.9f).alpha(1f).setDuration(90).start();
                         return true;
                     case MotionEvent.ACTION_MOVE: {
-                        inParent(view, e, a, b, pt);
-                        float dx = pt[0] - downX, dy = pt[1] - downY;
-                        if (!dragging && Math.hypot(dx, dy) > slop) {
+                        moves++;
+                        if (moveLogs < MAX_MOVE_LOGS_PER_GESTURE) {
+                            moveLogs++;
+                            logMove(e);
+                        }
+                        if (!dragging) {
+                            // The window has not moved yet, so local deltas are exact here.
+                            final float dlx = e.getX() - downLX, dly = e.getY() - downLY;
+                            if (Math.hypot(dlx, dly) <= slop) return true;
                             dragging = true;
                             if (panelOpen) closePanel();
+                            startDrag(dlx, dly, e.getRawX() - downRX, e.getRawY() - downRY);
                         }
-                        if (dragging) applyFab(clamp(startX + dx, 0, freeWidth()), clamp(startY + dy, 0, freeHeight()));
+                        float dx, dy;
+                        if (useRaw) {
+                            // Raw coordinates are screen space: moving our own window cannot feed back into them.
+                            dx = (e.getRawX() - downRX) * scale;
+                            dy = (e.getRawY() - downRY) * scale;
+                        } else {
+                            inParent(view, e, a, b, pt);
+                            dx = pt[0] - downX;
+                            dy = pt[1] - downY;
+                        }
+                        applyFab(clamp(startX + dx, 0, freeWidth()), clamp(startY + dy, 0, freeHeight()));
                         return true;
                     }
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
                         fab.animate().scaleX(1f).scaleY(1f).alpha(0.9f).setDuration(120).start();
-                        if (dragging) snapFab(dp);
-                        else if (e.getActionMasked() == MotionEvent.ACTION_UP) {
+                        if (dragging) {
+                            log(String.format(Locale.US,
+                                    "drag end: %d moves, raw delta (%.0f,%.0f), FAB moved (%.0f,%.0f) before snap, path %s",
+                                    moves, e.getRawX() - downRX, e.getRawY() - downRY, fabX - startX, fabY - startY,
+                                    useRaw ? "raw" : "local"));
+                            snapFab(dp);
+                        } else if (e.getActionMasked() == MotionEvent.ACTION_UP) {
                             view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                             if (panelOpen) closePanel();
                             else openPanel();
@@ -493,7 +529,35 @@ public final class Menu {
                         return false;
                 }
             }
+
+            /**
+             * Measures the raw-to-app scale from the slop phase, where the window was still in place:
+             * on a size-compat window raw is display pixels (here ~1/0.75 of app pixels). The best
+             * measurement (largest raw distance) is kept across gestures.
+             */
+            private void startDrag(float dlx, float dly, float drx, float dry) {
+                final double dl = Math.hypot(dlx, dly), dr = Math.hypot(drx, dry);
+                final boolean sameDirection = dlx * drx + dly * dry > 0;
+                if (dr >= MIN_CALIBRATION_RAW_PX && sameDirection) {
+                    final float k = (float) (dl / dr);
+                    if (k >= 0.25f && k <= 4f && dr > rawScaleBasis) {
+                        rawScale = k;
+                        rawScaleBasis = dr;
+                    }
+                }
+                useRaw = rawScale > 0f && dr >= MIN_CALIBRATION_RAW_PX && sameDirection;
+                scale = rawScale;
+                log(String.format(Locale.US, "drag start: local delta (%.0f,%.0f) raw delta (%.0f,%.0f) scale %.3f path %s",
+                        dlx, dly, drx, dry, rawScale, useRaw ? "raw" : "local (raw unusable)"));
+            }
         };
+    }
+
+    private static void logMove(MotionEvent e) {
+        if (touchLogs >= MAX_TOUCH_LOGS) return;
+        touchLogs++;
+        log(String.format(Locale.US, "touch fab move local(%.0f,%.0f) raw(%.0f,%.0f)", e.getX(), e.getY(),
+                e.getRawX(), e.getRawY()));
     }
 
     private static LinearLayout buildPanel(Context c, float dp, float[] cfg) {
