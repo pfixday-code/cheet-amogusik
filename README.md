@@ -1,4 +1,4 @@
-# Among Us Zygisk Menu 2.7.0
+# Among Us Zygisk Menu 2.7.1
 
 Zygisk module for `com.innersloth.spacemafia` (arm64). The single UI is a Java floating menu,
 working independently of Unity's GLES or Vulkan renderer. The legacy ImGui overlay and Unity input
@@ -19,9 +19,16 @@ teleport and bring-player are not a bypass of authoritative online position chec
 purely local. Commands are queued from JNI to the next local `PlayerControl.FixedUpdate`; Unity
 objects never cross into the Android UI thread. The snapshots contain copied ids, names and flags.
 
-The world zoom targets `HudManager.PlayerCam.cam`, not `Camera.main` or `UICamera`; it restores its
-baseline during meetings/minigames and when switched off. Noclip temporarily disables collision and
-wall shadows: `HudManager.ShadowQuad` is restored to its prior `activeSelf` state when switched off.
+The world zoom takes the camera from `HudManager.PlayerCam` using
+`Component.GetComponent(typeof(Camera))`, not `Camera.main` or the HUD `UICamera`; it restores its
+baseline during meetings/minigames and when switched off. Noclip watches `Collider.enabled` so game
+code that re-enables collision after death, voting or a scene change cannot silently disable it.
+Wall shadows are hidden through `HudManager.ShadowQuad` and restored to their prior `activeSelf`
+state when switched off.
+
+There is no guarantee of “anti-ban” or undetectability. Safety is limited to API-version checks,
+normal game RPC boundaries, host/Freeplay guards for Bring-player and a 750 ms player-action rate
+limit. Do not use player actions to disrupt other people's games or to provoke moderation.
 
 ## Layout
 
@@ -38,7 +45,7 @@ wall shadows: `HudManager.ShadowQuad` is restored to its prior `activeSelf` stat
 ## Build on GitHub
 
 Push `main`, wait for **Build Magisk module** and download `au_zygisk-magisk`. It contains
-`au_zygisk-2.7.0.zip`. `tools/prepare_tree.sh` restores third-party files when needed.
+`au_zygisk-2.7.1.zip`. `tools/prepare_tree.sh` restores third-party files when needed.
 
 ## Build locally
 
@@ -51,7 +58,7 @@ bash tools/prepare_tree.sh
 bash build/tree/tools/package_module.sh
 ```
 
-Install `out/au_zygisk-2.7.0.zip` in Magisk, enable Zygisk and reboot. Logs: `adb logcat -s AUMod` and
+Install `out/au_zygisk-2.7.1.zip` in Magisk, enable Zygisk and reboot. Logs: `adb logcat -s AUMod` and
 `/sdcard/Android/data/com.innersloth.spacemafia/files/au_report.txt`.
 
 And64InlineHook is pinned to commit `2787585`; `zygisk.hpp` comes from topjohnwu's module sample.

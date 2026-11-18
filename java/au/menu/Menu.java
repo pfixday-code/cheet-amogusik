@@ -49,7 +49,7 @@ import java.util.Locale;
  */
 public final class Menu {
     private static final String TAG = "AUMod";
-    private static final String VERSION = "v2.7.0";
+    private static final String VERSION = "v2.7.1";
 
     // Feature ids, player action ids and status bits are shared with src/java_menu.cpp.
     private static final int SPEED = 0, LIGHT = 1, NOCLIP = 2, KILL = 3, ZOOM = 4, REVEAL = 5, GHOSTS = 6;

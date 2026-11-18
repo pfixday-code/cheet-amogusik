@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -26,6 +27,7 @@ int g_offSpeed = -1, g_offGhostSpeed = -1, g_offOnLadder = -1;
 std::atomic<bool> g_ready{false};
 
 using SetEnabledFn = void (*)(void*, bool, const void*);
+using GetEnabledFn = bool (*)(void*, const void*);
 
 template <typename Fn>
 struct Managed {
@@ -37,6 +39,7 @@ struct Managed {
 };
 
 Managed<SetEnabledFn> g_setEnabled;
+Managed<GetEnabledFn> g_getEnabled;
 void (*o_fixedUpdate)(void*, const void*) = nullptr;
 float (*o_lightRadius)(void*, void*, const void*) = nullptr;
 void (*o_followerUpdate)(void*, const void*) = nullptr;
@@ -63,6 +66,8 @@ struct ExtraExports {
     void* (*method_get_return_type)(void*) = nullptr;
     const char* (*type_get_name)(void*) = nullptr;
     const uint16_t* (*string_chars)(void*) = nullptr;
+    void* (*class_get_type)(void*) = nullptr;
+    void* (*type_get_object)(void*) = nullptr;
 } g_x;
 
 template <typename Fn>
@@ -104,6 +109,14 @@ void* FindFieldUp(void* klass, const char* name) {
 void* ReadStatic(void* field) {
     void* value = nullptr;
     return field && il2::StaticGet(field, &value) ? value : nullptr;
+}
+
+void* FindMethodUp(void* klass, const char* name, int argc) {
+    for (void* k = klass; k;) {
+        if (void* method = il2::Method(k, name, argc)) return method;
+        k = g_x.class_get_parent ? g_x.class_get_parent(k) : nullptr;
+    }
+    return nullptr;
 }
 
 // ---------------------------------------------------------------- validation helpers
@@ -175,6 +188,9 @@ using GetFloatFn = float (*)(void*, const void*);
 using SetBoolFn = void (*)(void*, bool, const void*);
 using SetFloatFn = void (*)(void*, float, const void*);
 using GetListItemFn = void* (*)(void*, int, const void*);
+using GetComponentFn = void* (*)(void*, void*, const void*);
+using GetTaskIdFn = uint32_t (*)(void*, const void*);
+using CompleteTaskFn = void (*)(void*, uint32_t, const void*);
 
 // ---------------------------------------------------------------- generic list/string adapters
 
@@ -259,7 +275,8 @@ void ApplyNoclip(void* local) {
     if (!collider) return;
     const bool onLadder = OffsetOk(g_offOnLadder, 1) && At<bool>(local, g_offOnLadder);
     const bool want = g_cfg.noclip && !onLadder;
-    if (want && (!g_collider.applied || collider != g_collider.collider)) {
+    if (want && (!g_collider.applied || collider != g_collider.collider || g_getEnabled(collider, g_getEnabled.info))) {
+        // Meetings, death and scene transitions can re-enable the Collider behind our back.
         g_setEnabled(collider, false, g_setEnabled.info);
         g_collider.collider = collider;
         g_collider.applied = true;
@@ -373,7 +390,9 @@ struct WorldApi {
     void* hudInstance = nullptr;
     void* meetingInstance = nullptr;
     void* minigameInstance = nullptr;
+    void* cameraType = nullptr;
     int offFollower = -1, offCamera = -1, offShadow = -1;
+    Managed<GetComponentFn> getCameraComponent;
     Managed<GetObjectFn> getGameObject;
     Managed<GetBoolFn> getActive;
     Managed<SetBoolFn> setActive;
@@ -392,18 +411,42 @@ bool OverlayActive() {
     return ReadStatic(g_world.meetingInstance) || ReadStatic(g_world.minigameInstance);
 }
 
-struct ZoomState { void* camera = nullptr; bool applied = false; float base = 3.f; } g_zoom;
+void* CurrentUiCamera() {
+    void* hud = CurrentHud();
+    return hud && OffsetOk(g_world.offCamera, 8) ? At<void*>(hud, g_world.offCamera) : nullptr;
+}
+
+struct ZoomState {
+    void* camera = nullptr;
+    void* follower = nullptr;
+    bool applied = false;
+    float base = 3.f;
+} g_zoom;
+
+void RestoreZoom() {
+    if (g_zoom.applied && g_zoom.camera)
+        g_world.setSize(g_zoom.camera, g_zoom.base, g_world.setSize.info);
+    g_zoom = {};
+}
 
 void ApplyWorldZoom(void* follower) {
-    if (!g_feat.zoom || !follower || !OffsetOk(g_world.offCamera, 8)) return;
-    void* camera = At<void*>(follower, g_world.offCamera);
-    if (!camera) return;
+    if (!g_feat.zoom || !follower || !g_world.cameraType || !g_world.getCameraComponent) return;
+    // GetComponent(Type) belongs to the FollowerCamera component, so this is not Camera.main and
+    // cannot accidentally select the HUD Canvas camera during tasks or a meeting.
+    void* camera = follower == g_zoom.follower && g_zoom.camera
+            ? g_zoom.camera
+            : g_world.getCameraComponent(follower, g_world.cameraType, g_world.getCameraComponent.info);
+    if (!camera || camera == CurrentUiCamera()) {
+        RestoreZoom();
+        return;
+    }
     const float size = g_world.getSize(camera, g_world.getSize.info);
     if (!std::isfinite(size) || size < 0.1f || size > 100.f) return;
-    if (camera != g_zoom.camera) {
+    if (camera != g_zoom.camera || follower != g_zoom.follower) {
+        RestoreZoom();
         g_zoom.camera = camera;
+        g_zoom.follower = follower;
         g_zoom.base = size;
-        g_zoom.applied = false;
     }
     if (!g_cfg.zoomOn || OverlayActive()) {
         if (g_zoom.applied) {
@@ -412,14 +455,10 @@ void ApplyWorldZoom(void* follower) {
         }
         return;
     }
-    if (!g_zoom.applied) g_zoom.base = size;
-    const float base = g_zoom.base;
-    const float target = base * g_cfg.zoomMul;
-    if (std::isfinite(target) && target >= 0.1f && target <= 100.f) {
-        // UICamera, ShadowCamera and their Canvas layout are deliberately never touched.
-        if (size != target) g_world.setSize(camera, target, g_world.setSize.info);
-        g_zoom.applied = true;
-    }
+    const float target = g_zoom.base * g_cfg.zoomMul;
+    if (!std::isfinite(target) || target < 0.1f || target > 100.f) return;
+    if (size != target) g_world.setSize(camera, target, g_world.setSize.info);
+    g_zoom.applied = true;
 }
 
 struct ShadowState {
@@ -460,14 +499,16 @@ struct PlayerRegistry {
     void* allPlayersField = nullptr;
     void* clientInstance = nullptr;
     ListApi allPlayers, tasks;
-    int offId = -1, offNetTransform = -1, offName = -1, offDisconnected = -1;
+    int offId = -1, offNetTransform = -1, offDisconnected = -1;
     int offMoveable = -1, offTasks = -1, offNetworkMode = -1, offAmHost = -1;
+    Managed<GetObjectFn> getPlayerName;
+    Managed<GetBoolFn> getAmHost;
     Managed<Vector2 (*)(void*, const void*)> getTruePosition;
     Managed<void (*)(void*, Vector2, const void*)> rpcSnapTo;
     Managed<void (*)(void*, void*, const void*)> setTarget;
     Managed<void (*)(void*, void*, const void*)> cmdReport;
-    Managed<void (*)(void*, int, const void*)> rpcCompleteTask;
-    Managed<int (*)(void*, const void*)> getTaskId;
+    Managed<CompleteTaskFn> rpcCompleteTask;
+    Managed<GetTaskIdFn> getTaskId;
 } g_players;
 
 struct RuntimePlayer {
@@ -492,7 +533,9 @@ std::vector<RuntimePlayer> EnumeratePlayers(void* local) {
         p.object = object;
         p.info = info;
         p.id = object != local && OffsetOk(g_players.offId, 1) ? At<uint8_t>(object, g_players.offId) : 255;
-        p.name = OffsetOk(g_players.offName, 8) ? ManagedString(At<void*>(info, g_players.offName)) : "Player";
+        p.name = g_players.getPlayerName
+                ? ManagedString(g_players.getPlayerName(info, g_players.getPlayerName.info))
+                : "Player";
         if (p.name.empty()) p.name = "Player " + std::to_string(p.id);
         p.dead = IsDead(info);
         p.disconnected = OffsetOk(g_players.offDisconnected, 1) && At<bool>(info, g_players.offDisconnected);
@@ -522,7 +565,8 @@ std::string ActionName(const RuntimePlayer& p) {
 bool HostOrFreeplay() {
     void* client = ReadStatic(g_players.clientInstance);
     if (!client) return false;
-    const bool host = OffsetOk(g_players.offAmHost, 1) && At<bool>(client, g_players.offAmHost);
+    const bool host = (g_players.getAmHost && g_players.getAmHost(client, g_players.getAmHost.info)) ||
+                      (OffsetOk(g_players.offAmHost, 1) && At<bool>(client, g_players.offAmHost));
     // NetworkModes: OnlineGame = 0, LocalGame = 1, FreePlay = 2.
     const bool freeplay = OffsetOk(g_players.offNetworkMode) && At<int32_t>(client, g_players.offNetworkMode) == 2;
     return host || freeplay;
@@ -692,30 +736,41 @@ bool InitWorld() {
     void* component = il2::FindClass("UnityEngine", "Component");
     void* gameObject = il2::FindClass("UnityEngine", "GameObject");
     void* hud = il2::FindClassIn("Assembly-CSharp.dll", "", "HudManager");
-    g_world.hudInstance = FindFieldUp(hud, "Instance");
-    Log("class HudManager %s, inherited Instance %s", hud ? "OK" : "MISSING", g_world.hudInstance ? "OK" : "MISSING");
+    g_world.hudInstance = FindFieldUp(hud, "_instance");
+    Log("class HudManager %s, inherited _instance %s", hud ? "OK" : "MISSING", g_world.hudInstance ? "OK" : "MISSING");
 
     void* followerField = il2::Field(hud, "PlayerCam");
     g_world.offFollower = il2::FieldOffset(followerField);
     void* follower = FieldClass(followerField);
-    void* camField = il2::Field(follower, "cam");
-    g_world.offCamera = il2::FieldOffset(camField);
-    const bool followerOk = FieldIs(followerField, g_world.offFollower, 8, nullptr, "HudManager.PlayerCam") &&
-                            FieldIs(camField, g_world.offCamera, 8, "UnityEngine.Camera", "FollowerCamera.cam");
+    void* uiCameraField = il2::Field(hud, "UICamera");
+    g_world.offCamera = il2::FieldOffset(uiCameraField);
+    const bool followerOk = FieldIs(followerField, g_world.offFollower, 8, nullptr, "HudManager.PlayerCam");
+    FieldIs(uiCameraField, g_world.offCamera, 8, "UnityEngine.Camera", "HudManager.UICamera");
+
+    if (camera && g_x.class_get_type && g_x.type_get_object) {
+        void* classType = g_x.class_get_type(camera);
+        g_world.cameraType = classType ? g_x.type_get_object(classType) : nullptr;
+    }
+    void* getComponent = FindMethodUp(component, "GetComponent", 1);
+    const bool getComponentOk = g_world.cameraType &&
+            Param0(getComponent, "System.Type", "Component.GetComponent(Type)") &&
+            Returns(getComponent, "UnityEngine.Component", "Component.GetComponent(Type)") &&
+            Bind(getComponent, "Component.GetComponent(Camera)", &g_world.getCameraComponent);
     void* getSize = il2::Method(camera, "get_orthographicSize", 0);
     void* setSize = il2::Method(camera, "set_orthographicSize", 1);
     const bool cameraOk = Returns(getSize, "System.Single", "Camera.get_orthographicSize") &&
                           Param0(setSize, "System.Single", "Camera.set_orthographicSize") &&
                           Bind(getSize, "Camera.get_orthographicSize", &g_world.getSize) &&
                           Bind(setSize, "Camera.set_orthographicSize", &g_world.setSize);
-    if (cameraOk && g_world.hudInstance) {
-        void* setTarget = il2::Method(follower, "SetTarget", 1);
-        if (Param0(setTarget, "UnityEngine.MonoBehaviour", "FollowerCamera.SetTarget") &&
-            Returns(setTarget, "System.Void", "FollowerCamera.SetTarget"))
-            Bind(setTarget, "FollowerCamera.SetTarget", &g_world.setTarget);
-    }
-    void* followerUpdate = il2::Method(follower, "Update", 0);
-    if (followerOk && cameraOk && g_world.hudInstance && ValidTarget(followerUpdate, "FollowerCamera.Update")) {
+    void* setTarget = FindMethodUp(follower, "SetTarget", 1);
+    if (followerOk && g_world.hudInstance &&
+        Param0(setTarget, "UnityEngine.MonoBehaviour", "FollowerCamera.SetTarget") &&
+        Returns(setTarget, "System.Void", "FollowerCamera.SetTarget"))
+        Bind(setTarget, "FollowerCamera.SetTarget", &g_world.setTarget);
+
+    void* followerUpdate = FindMethodUp(follower, "Update", 0);
+    if (followerOk && cameraOk && getComponentOk && g_world.hudInstance &&
+        ValidTarget(followerUpdate, "FollowerCamera.Update")) {
         g_feat.zoom = InstallHook("FollowerCamera.Update", il2::MethodPointer(followerUpdate),
                                   hkFollowerUpdate, &o_followerUpdate);
     }
@@ -731,10 +786,10 @@ bool InitWorld() {
                       Bind(setActive, "GameObject.SetActive", &g_world.setActive);
     void* shadowField = il2::Field(hud, "ShadowQuad");
     g_world.offShadow = il2::FieldOffset(shadowField);
-    g_feat.wallVision = goOk && g_world.hudInstance &&
-                        FieldIs(shadowField, g_world.offShadow, 8, nullptr, "HudManager.ShadowQuad");
-    g_world.meetingInstance = FindFieldUp(il2::FindClassIn("Assembly-CSharp.dll", "", "MeetingHud"), "Instance");
-    g_world.minigameInstance = FindFieldUp(il2::FindClassIn("Assembly-CSharp.dll", "", "Minigame"), "Instance");
+    g_feat.wallVision = goOk && g_world.hudInstance && FieldIs(shadowField, g_world.offShadow, 8,
+                                                              "UnityEngine.MeshRenderer", "HudManager.ShadowQuad");
+    g_world.meetingInstance = FindFieldUp(il2::FindClassIn("Assembly-CSharp.dll", "", "MeetingHud"), "_instance");
+    g_world.minigameInstance = FindFieldUp(il2::FindClassIn("Assembly-CSharp.dll", "", "Minigame"), "_instance");
     return g_feat.zoom || g_feat.wallVision || g_world.setTarget;
 }
 
@@ -797,9 +852,9 @@ void InitPlayerActions(void* pc, void* infoClass, bool hookedFixed) {
     void* idField = il2::Field(pc, "PlayerId");
     g_players.offId = il2::FieldOffset(idField);
     bool idOk = FieldIs(idField, g_players.offId, 1, "System.Byte", "PlayerControl.PlayerId");
-    void* nameField = il2::Field(infoClass, "PlayerName");
-    g_players.offName = il2::FieldOffset(nameField);
-    bool nameOk = FieldIs(nameField, g_players.offName, 8, "System.String", "NetworkedPlayerInfo.PlayerName");
+    void* getName = il2::Method(infoClass, "get_PlayerName", 0);
+    bool nameOk = Returns(getName, "System.String", "NetworkedPlayerInfo.get_PlayerName") &&
+                  Bind(getName, "NetworkedPlayerInfo.get_PlayerName", &g_players.getPlayerName);
     void* disconnectedField = il2::Field(infoClass, "Disconnected");
     g_players.offDisconnected = il2::FieldOffset(disconnectedField);
     bool disconnectedOk = FieldIs(disconnectedField, g_players.offDisconnected, 1, "System.Boolean",
@@ -835,7 +890,7 @@ void InitPlayerActions(void* pc, void* infoClass, bool hookedFixed) {
     void* complete = il2::Method(pc, "RpcCompleteTask", 1);
     bool taskListOk = FieldIs(tasksField, g_players.offTasks, 8, nullptr, "PlayerControl.myTasks") &&
                       InitList(g_players.tasks, tasksField, "PlayerTask", "myTasks list");
-    bool completeOk = Param0(complete, "System.Int32", "PlayerControl.RpcCompleteTask") &&
+    bool completeOk = Param0(complete, "System.UInt32", "PlayerControl.RpcCompleteTask") &&
                       Returns(complete, "System.Void", "PlayerControl.RpcCompleteTask") &&
                       Bind(complete, "PlayerControl.RpcCompleteTask", &g_players.rpcCompleteTask);
     void* taskType = FieldClass(tasksField);
@@ -843,7 +898,7 @@ void InitPlayerActions(void* pc, void* infoClass, bool hookedFixed) {
     // Resolve PlayerTask directly: FieldClass(myTasks) is List<PlayerTask>, not the task class.
     void* playerTaskClass = il2::FindClassIn("Assembly-CSharp.dll", "", "PlayerTask");
     void* taskId = il2::Method(playerTaskClass, "get_Id", 0);
-    bool idReadOk = Returns(taskId, "System.Int32", "PlayerTask.get_Id") &&
+    bool idReadOk = Returns(taskId, "System.UInt32", "PlayerTask.get_Id") &&
                     Bind(taskId, "PlayerTask.get_Id", &g_players.getTaskId);
     g_feat.completeTasks = hookedFixed && taskListOk && completeOk && idReadOk;
 
@@ -855,6 +910,9 @@ void InitPlayerActions(void* pc, void* infoClass, bool hookedFixed) {
     void* hostField = il2::Field(clientClass, "AmHost");
     g_players.offAmHost = il2::FieldOffset(hostField);
     bool hostOk = FieldIs(hostField, g_players.offAmHost, 1, "System.Boolean", "AmongUsClient.AmHost");
+    void* hostMethod = FindMethodUp(clientClass, "get_AmHost", 0);
+    if (Returns(hostMethod, "System.Boolean", "AmongUsClient.get_AmHost"))
+        Bind(hostMethod, "AmongUsClient.get_AmHost", &g_players.getAmHost);
     if (!modeOk) g_players.offNetworkMode = -1;
     if (!hostOk) g_players.offAmHost = -1;
 }
@@ -874,6 +932,13 @@ bool QueuePlayerAction(int action, int targetId) {
     std::lock_guard<std::mutex> lk(g_actionMu);
     if (g_actionPending.load()) return false;
     static uint32_t issued = 0;
+    static auto lastAccepted = std::chrono::steady_clock::time_point();
+    const auto now = std::chrono::steady_clock::now();
+    if (issued != 0 && now - lastAccepted < std::chrono::milliseconds(750)) {
+        g_actionMessage = "Action rate limit: wait 750 ms before the next command";
+        return false;
+    }
+    lastAccepted = now;
     g_command = {++issued, action, targetId};
     g_actionPending.store(true);
     g_actionMessage = "Player action queued for the next Unity tick";
@@ -899,6 +964,8 @@ void InitFeatures() {
     ResolveExtra(&g_x.method_get_return_type, "il2cpp_method_get_return_type");
     ResolveExtra(&g_x.type_get_name, "il2cpp_type_get_name");
     ResolveExtra(&g_x.string_chars, "il2cpp_string_chars");
+    ResolveExtra(&g_x.class_get_type, "il2cpp_class_get_type");
+    ResolveExtra(&g_x.type_get_object, "il2cpp_type_get_object");
 
     void* pc = il2::FindClassIn("Assembly-CSharp.dll", "", "PlayerControl");
     void* pp = il2::FindClassIn("Assembly-CSharp.dll", "", "PlayerPhysics");
@@ -930,6 +997,9 @@ void InitFeatures() {
     void* setEnabled = il2::Method(behaviour, "set_enabled", 1);
     if (Param0(setEnabled, "System.Boolean", "Behaviour.set_enabled"))
         Bind(setEnabled, "UnityEngine.Behaviour.set_enabled", &g_setEnabled);
+    void* getEnabled = il2::Method(behaviour, "get_enabled", 0);
+    if (Returns(getEnabled, "System.Boolean", "Behaviour.get_enabled"))
+        Bind(getEnabled, "UnityEngine.Behaviour.get_enabled", &g_getEnabled);
 
     void* fixedUpdate = il2::Method(pc, "FixedUpdate", 0);
     bool hookedFixed = false;
@@ -939,7 +1009,7 @@ void InitFeatures() {
 
     g_feat.speed = hookedFixed && OffsetOk(g_offPhysics, 8) && OffsetOk(g_offSpeed);
     g_feat.kill = hookedFixed && OffsetOk(g_offKillTimer);
-    g_feat.noclip = hookedFixed && OffsetOk(g_offCollider, 8) && g_setEnabled;
+    g_feat.noclip = hookedFixed && OffsetOk(g_offCollider, 8) && g_setEnabled && g_getEnabled;
     InitWorld();
     void* infoClass = nullptr;
     InitPlayerExtras(pc, hookedFixed, &infoClass);

@@ -1,6 +1,6 @@
 id=au_zygisk
 name=Among Us Zygisk Menu
-version=2.7.0
-versionCode=270
+version=2.7.1
+versionCode=271
 author=rewrite
 description=Renderer-independent Among Us menu: speed, noclip with wall vision, safe world-camera zoom, ESP and player actions. Requires Zygisk, arm64.
