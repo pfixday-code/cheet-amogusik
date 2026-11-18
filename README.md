@@ -1,4 +1,4 @@
-# Among Us Zygisk Menu 2.7.1
+# Among Us Zygisk Menu 2.7.2
 
 Zygisk module for `com.innersloth.spacemafia` (arm64). The single UI is a Java floating menu,
 working independently of Unity's GLES or Vulkan renderer. The legacy ImGui overlay and Unity input
@@ -45,7 +45,7 @@ limit. Do not use player actions to disrupt other people's games or to provoke m
 ## Build on GitHub
 
 Push `main`, wait for **Build Magisk module** and download `au_zygisk-magisk`. It contains
-`au_zygisk-2.7.1.zip`. `tools/prepare_tree.sh` restores third-party files when needed.
+`au_zygisk-2.7.2.zip`. `tools/prepare_tree.sh` restores third-party files when needed.
 
 ## Build locally
 
@@ -58,7 +58,7 @@ bash tools/prepare_tree.sh
 bash build/tree/tools/package_module.sh
 ```
 
-Install `out/au_zygisk-2.7.1.zip` in Magisk, enable Zygisk and reboot. Logs: `adb logcat -s AUMod` and
+Install `out/au_zygisk-2.7.2.zip` in Magisk, enable Zygisk and reboot. Logs: `adb logcat -s AUMod` and
 `/sdcard/Android/data/com.innersloth.spacemafia/files/au_report.txt`.
 
 And64InlineHook is pinned to commit `2787585`; `zygisk.hpp` comes from topjohnwu's module sample.

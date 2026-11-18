@@ -49,7 +49,7 @@ import java.util.Locale;
  */
 public final class Menu {
     private static final String TAG = "AUMod";
-    private static final String VERSION = "v2.7.1";
+    private static final String VERSION = "v2.7.2";
 
     // Feature ids, player action ids and status bits are shared with src/java_menu.cpp.
     private static final int SPEED = 0, LIGHT = 1, NOCLIP = 2, KILL = 3, ZOOM = 4, REVEAL = 5, GHOSTS = 6;
@@ -233,11 +233,11 @@ public final class Menu {
         fabY = clamp(fabFy, 0f, 1f) * freeHeight();
         fabLp.x = Math.round(fabX);
         fabLp.y = Math.round(fabY);
-        panel.setVisibility(View.INVISIBLE);  // an invisible root view hides its window and its touch area
+        panel.setVisibility(View.INVISIBLE);
         wm.addView(fabHost, fabLp);
         fabAdded = true;
-        wm.addView(panel, panelLp);
-        panelAdded = true;
+        // Panel is created on demand in openPanel(), never left as an invisible touchable window.
+        panelAdded = false;
         decor.addOnLayoutChangeListener(PARENT_RESIZE);
         installDrawCounters();
         log("attached to " + a.getClass().getName() + " as sub-windows");
@@ -969,6 +969,12 @@ public final class Menu {
     private static void openPanel() {
         if (panel == null) return;
         panelOpen = true;
+        if (windowMode && wm != null && panelLp != null && !panelAdded) {
+            // A merely INVISIBLE panel still retains an input channel and a touchable window in
+            // Android. Add it only while open, so the game is genuinely unoccluded when closed.
+            wm.addView(panel, panelLp);
+            panelAdded = true;
+        }
         placePanel();
         // Do not animate alpha/scale or issue a transaction per frame on this size-compat window.
         panel.animate().cancel();
@@ -990,6 +996,10 @@ public final class Menu {
         panel.setScaleX(1f);
         panel.setScaleY(1f);
         panel.setVisibility(View.INVISIBLE);
+        if (windowMode && wm != null && panelAdded) {
+            removeWindow(panel);
+            panelAdded = false;
+        }
     }
     // ---------------------------------------------------------------- status
 
