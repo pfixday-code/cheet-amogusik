@@ -94,6 +94,8 @@ void ConfigLoad() {
         else if (!strcmp(key, "zoomMul")) g_cfg.zoomMul = v;
         else if (!strcmp(key, "revealOn")) g_cfg.revealOn = v != 0.f;
         else if (!strcmp(key, "ghostsOn")) g_cfg.ghostsOn = v != 0.f;
+        else if (!strcmp(key, "wallVisionOn")) g_cfg.wallVisionOn = v != 0.f;
+        else if (!strcmp(key, "invisibleOn")) g_cfg.invisibleOn = v != 0.f;
         else ++bad;
     }
     fclose(f);
@@ -116,9 +118,9 @@ void ConfigSave() {
     }
     const int n = fprintf(f,
                           "speedOn=%d\nspeedMul=%.3f\nnoclip=%d\nlightOn=%d\nlightMul=%.3f\nkillOn=%d\n"
-                          "zoomOn=%d\nzoomMul=%.3f\nrevealOn=%d\nghostsOn=%d\n",
+                          "zoomOn=%d\nzoomMul=%.3f\nrevealOn=%d\nghostsOn=%d\nwallVisionOn=%d\ninvisibleOn=%d\n",
                           c.speedOn, c.speedMul, c.noclip, c.lightOn, c.lightMul, c.killOn, c.zoomOn,
-                          c.zoomMul, c.revealOn, c.ghostsOn);
+                          c.zoomMul, c.revealOn, c.ghostsOn, c.wallVisionOn, c.invisibleOn);
     const bool written = n > 0 && fflush(f) == 0;
     if (fclose(f) != 0 || !written) {
         Log("config: write to %s failed", tmp.c_str());

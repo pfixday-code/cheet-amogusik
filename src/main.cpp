@@ -2,7 +2,6 @@
 #include "features.h"
 #include "il2cpp.h"
 #include "java_menu.h"
-#include "overlay.h"
 #include "zygisk.hpp"
 #include <atomic>
 #include <cstdio>
@@ -55,7 +54,8 @@ void Il2cppWorker() {
     InitFeatures();
     Log("stage: features initialised");
 
-    // Renderer-independent menu; the ImGui overlay stays as a second UI when GLES frames reach it.
+    // Exactly one menu and one input path. The legacy GLES/ImGui overlay used to swallow Unity
+    // touch gestures and render a second set of controls on GLES; Java windows own the UI now.
     StartJavaMenu();
 
     const std::string dumpPath = g_dataDir + "/files/au_dump.txt";
@@ -63,12 +63,6 @@ void Il2cppWorker() {
         if (g_requestDump.exchange(false)) il2::Dump(dumpPath.c_str());
         sleep(1);
     }
-}
-
-void InputWatchdog() {
-    for (int i = 0; i < 60 && !InputWrapped(); ++i) sleep(1);
-    if (!InputWrapped())
-        Log("input: UnityPlayer.nativeInjectEvent was NOT wrapped within 60 s, the menu will not receive touches");
 }
 
 void StartModule(JNIEnv* env, const std::string& dataDir) {
@@ -81,10 +75,7 @@ void StartModule(JNIEnv* env, const std::string& dataDir) {
         g_vm = nullptr;
         Log("java menu: GetJavaVM failed");
     }
-    InstallInputHook(env);
-    std::thread(InstallEglHooks).detach();
     std::thread(Il2cppWorker).detach();
-    std::thread(InputWatchdog).detach();
 }
 
 class AmongUsModule : public zygisk::ModuleBase {

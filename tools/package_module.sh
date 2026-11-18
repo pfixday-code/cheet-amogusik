@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}"
 [ -n "$NDK" ] && [ -x "$NDK/ndk-build" ] || { echo "set ANDROID_NDK_HOME to an NDK containing ndk-build" >&2; exit 1; }
-for f in jni/Android.mk jni/Application.mk module/module.prop third_party/And64.cpp third_party/imgui/imgui.cpp; do
+for f in jni/Android.mk jni/Application.mk module/module.prop third_party/And64.cpp third_party/zygisk.hpp; do
     [ -f "$ROOT/$f" ] || { echo "missing $f in $ROOT" >&2; exit 1; }
 done
 

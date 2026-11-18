@@ -35,6 +35,8 @@ struct Config {
     float zoomMul = 1.5f;
     bool revealOn = false;
     bool ghostsOn = false;
+    bool wallVisionOn = false;
+    bool invisibleOn = false;
 };
 extern Config g_cfg;
 void ConfigLoad();

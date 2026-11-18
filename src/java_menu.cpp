@@ -6,15 +6,20 @@
 #include <cmath>
 #include <cstring>
 #include <iterator>
+#include <string>
+#include <vector>
 
 JavaVM* g_vm = nullptr;
 
 namespace {
 
-// Must match Menu.java.
+
 constexpr int kSpeed = 0, kLight = 1, kNoclip = 2, kKill = 3, kZoom = 4, kReveal = 5, kGhosts = 6;
+constexpr int kWallVision = 7, kInvisible = 8;
 constexpr int kStSpeed = 1, kStNoclip = 2, kStLight = 4, kStKill = 8, kStLocal = 16, kStZoom = 32,
-              kStReveal = 64, kStGhosts = 128;
+              kStReveal = 64, kStGhosts = 128, kStWallVision = 256, kStInvisible = 512,
+              kStPlayers = 1024, kStTeleport = 2048, kStBring = 4096, kStSpectate = 8192,
+              kStReport = 16384, kStCompleteTasks = 32768;
 
 jclass g_menuClass = nullptr;  // global ref; keeps the dex class loader alive
 
@@ -24,8 +29,8 @@ struct Local {
     ~Local() { if (obj) env->DeleteLocalRef(obj); }
 };
 
-float ClampMul(float v, float lo, float hi, float fallback) {
-    return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+float ClampMul(float value, float low, float high, float fallback) {
+    return std::isfinite(value) ? std::clamp(value, low, high) : fallback;
 }
 
 void JNICALL MenuSet(JNIEnv*, jclass, jint id, jboolean on, jfloat value) {
@@ -47,6 +52,8 @@ void JNICALL MenuSet(JNIEnv*, jclass, jint id, jboolean on, jfloat value) {
             break;
         case kReveal: g_cfg.revealOn = b; break;
         case kGhosts: g_cfg.ghostsOn = b; break;
+        case kWallVision: g_cfg.wallVisionOn = b; break;
+        case kInvisible: g_cfg.invisibleOn = b; break;
         default: return;
     }
     ConfigSave();
@@ -61,19 +68,66 @@ jint JNICALL MenuStatus(JNIEnv*, jclass) {
     if (g_feat.zoom) st |= kStZoom;
     if (g_feat.reveal) st |= kStReveal;
     if (g_feat.ghosts) st |= kStGhosts;
+    if (g_feat.wallVision) st |= kStWallVision;
+    if (g_feat.invisible) st |= kStInvisible;
+    if (g_feat.players) st |= kStPlayers;
+    if (g_feat.teleport) st |= kStTeleport;
+    if (g_feat.bring) st |= kStBring;
+    if (g_feat.spectate) st |= kStSpectate;
+    if (g_feat.report) st |= kStReport;
+    if (g_feat.completeTasks) st |= kStCompleteTasks;
     if (g_feat.localPlayerSeen) st |= kStLocal;
     return st;
 }
 
 jfloatArray JNICALL MenuConfig(JNIEnv* env, jclass) {
-    const jfloat v[] = {g_cfg.speedOn ? 1.f : 0.f,  g_cfg.speedMul,          g_cfg.lightOn ? 1.f : 0.f,
-                        g_cfg.lightMul,             g_cfg.noclip ? 1.f : 0.f, g_cfg.killOn ? 1.f : 0.f,
-                        g_cfg.zoomOn ? 1.f : 0.f,   g_cfg.zoomMul,           g_cfg.revealOn ? 1.f : 0.f,
-                        g_cfg.ghostsOn ? 1.f : 0.f};
+    const jfloat v[] = {
+        g_cfg.speedOn ? 1.f : 0.f, g_cfg.speedMul,
+        g_cfg.lightOn ? 1.f : 0.f, g_cfg.lightMul,
+        g_cfg.noclip ? 1.f : 0.f,
+        g_cfg.killOn ? 1.f : 0.f,
+        g_cfg.zoomOn ? 1.f : 0.f, g_cfg.zoomMul,
+        g_cfg.revealOn ? 1.f : 0.f,
+        g_cfg.ghostsOn ? 1.f : 0.f,
+        g_cfg.wallVisionOn ? 1.f : 0.f,
+        g_cfg.invisibleOn ? 1.f : 0.f,
+    };
     jfloatArray arr = env->NewFloatArray(static_cast<jsize>(std::size(v)));
     if (!arr) return nullptr;
     env->SetFloatArrayRegion(arr, 0, static_cast<jsize>(std::size(v)), v);
     return arr;
+}
+
+jobjectArray JNICALL MenuPlayers(JNIEnv* env, jclass) {
+    const std::vector<PlayerEntry> players = GetPlayersSnapshot();
+    Local stringClass{env, env->FindClass("java/lang/String")};
+    if (!stringClass.obj) return nullptr;
+    jobjectArray result = env->NewObjectArray(static_cast<jsize>(players.size()),
+                                               static_cast<jclass>(stringClass.obj), nullptr);
+    if (!result) return nullptr;
+    for (size_t i = 0; i < players.size(); ++i) {
+        const PlayerEntry& p = players[i];
+        const std::string row = std::to_string(p.id) + "\t" + (p.local ? "1" : "0") + "\t" +
+                                (p.dead ? "1" : "0") + "\t" + p.name;
+        Local str{env, env->NewStringUTF(row.c_str())};
+        if (!str.obj) return nullptr;
+        env->SetObjectArrayElement(result, static_cast<jsize>(i), static_cast<jstring>(str.obj));
+        if (env->ExceptionCheck()) return nullptr;
+    }
+    return result;
+}
+
+jboolean JNICALL MenuAction(JNIEnv*, jclass, jint action, jint targetId) {
+    return QueuePlayerAction(action, targetId) ? JNI_TRUE : JNI_FALSE;
+}
+
+jstring JNICALL MenuActionInfo(JNIEnv* env, jclass) {
+    const PlayerActionState state = GetPlayerActionState();
+    std::string message = state.message;
+    std::replace(message.begin(), message.end(), '|', '/');
+    const std::string row = std::to_string(state.completed) + "|" + (state.pending ? "1" : "0") + "|" +
+                            (state.spectating ? "1" : "0") + "|" + message;
+    return env->NewStringUTF(row.c_str());
 }
 
 void JNICALL MenuDump(JNIEnv*, jclass) { g_requestDump = true; }
@@ -103,7 +157,7 @@ bool LoadMenu(JNIEnv* env) {
     Local loaderCls{env, env->FindClass("dalvik/system/InMemoryDexClassLoader")};
     if (!loaderCls.obj) return Fail(env, "InMemoryDexClassLoader lookup (needs Android 8+)");
     Local clCls{env, env->FindClass("java/lang/ClassLoader")};
-    if (!clCls.obj) return Fail(env, "ClassLoader lookup");
+    if (!clCls.obj) return Fail(env, "ClassLoader method lookup");
 
     auto cl = static_cast<jclass>(clCls.obj);
     jmethodID getSystem = env->GetStaticMethodID(cl, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
@@ -127,6 +181,9 @@ bool LoadMenu(JNIEnv* env) {
         {"nativeSet", "(IZF)V", reinterpret_cast<void*>(MenuSet)},
         {"nativeStatus", "()I", reinterpret_cast<void*>(MenuStatus)},
         {"nativeConfig", "()[F", reinterpret_cast<void*>(MenuConfig)},
+        {"nativePlayers", "()[Ljava/lang/String;", reinterpret_cast<void*>(MenuPlayers)},
+        {"nativeAction", "(II)Z", reinterpret_cast<void*>(MenuAction)},
+        {"nativeActionInfo", "()Ljava/lang/String;", reinterpret_cast<void*>(MenuActionInfo)},
         {"nativeDump", "()V", reinterpret_cast<void*>(MenuDump)},
         {"nativeLog", "(Ljava/lang/String;)V", reinterpret_cast<void*>(MenuLog)},
     };

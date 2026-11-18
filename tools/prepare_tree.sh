@@ -30,7 +30,7 @@ for d in src java tools jni module third_party; do
     fi
 done
 
-if [ ! -f "$TREE/third_party/And64.cpp" ] || [ ! -f "$TREE/third_party/imgui/imgui.cpp" ] || [ ! -f "$TREE/third_party/zygisk.hpp" ]; then
+if [ ! -f "$TREE/third_party/And64.cpp" ] || [ ! -f "$TREE/third_party/zygisk.hpp" ]; then
     echo "third_party incomplete, downloading"
     bash "$TREE/tools/fetch_third_party.sh"
 fi
